@@ -122,6 +122,32 @@ class Trainer:
     def load_model(self, checkpoint_path):
         self.model.load_state_dict(torch.load(checkpoint_path)['model_state_dict'], strict=False)
 
+    def save_checkpoint(self, epoch, optimizer, best_loss, checkpoint_path='checkpoint.pth'):
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'best_loss': best_loss,
+        }
+        torch.save(checkpoint, checkpoint_path)
+        print(f"Checkpoint saved at epoch {epoch}")
+
+    def load_checkpoint(self, checkpoint_path, optimizer):
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.model.to(self.device)
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(self.device)
+        
+        start_epoch = checkpoint['epoch'] + 1
+        best_loss = checkpoint['best_loss']
+        print(f"Resuming from epoch {start_epoch}, best_loss: {best_loss}")
+        return start_epoch, best_loss
+
     def calc_loss(self,
                   I_to,
                   I_from,
@@ -267,8 +293,11 @@ class Trainer:
                 I_gen_to_rec = self.downsample_256(I_G_from_0_1).clip(0, 1)
 
             losses = sum_losses(losses, info)
+            
             for k in range(bsz):
                 files.append([I_from[k].cpu(), I_gen_to_rec[k].cpu(), I_gen_to[k].cpu(), I_to[k].cpu()])
+            
+            torch.cuda.empty_cache()
 
         for key, val in losses.items():
             val /= len(self.test_dataloader)
@@ -281,14 +310,18 @@ class Trainer:
 
         return losses['loss'] / len(self.test_dataloader)
 
-    def train_loop(self, epochs):
-        # self.validate()
-        for epoch in range(epochs):
+    def train_loop(self, epochs, start_epoch=0, resume=False):
+        if not resume:
+            self.validate()
+        
+        for epoch in range(start_epoch, epochs):
             self.train_one_epoch()
             loss = self.validate()
 
             self.save_model(f'rotate_{epoch}', save_online=False)
             self.save_model('last')
+            self.save_checkpoint(epoch, self.optimizer, self.best_loss)
+            
             if loss <= self.best_loss:
                 self.best_loss = loss
                 self.save_model(f'best', save_online=False)
@@ -325,9 +358,9 @@ def main(args):
     test_dataset = Rotate_dataset(*list(zip(*X_test)), is_test=True)
 
     train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, pin_memory=True, shuffle=True,
-                                  drop_last=True, num_workers=4)
+                                  drop_last=True, num_workers=2)
     test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, pin_memory=True, shuffle=False,
-                                 num_workers=4)
+                                 num_workers=2)
 
     logger = WandbLogger(name=args.name_run, project='HairFast-Rotate')
     logger.start_logging()
@@ -337,7 +370,15 @@ def main(args):
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=0.000001)
 
     trainer = Trainer(model, args, optimizer, None, train_dataloader, test_dataloader, logger)
-    trainer.train_loop(1000)
+    
+    start_epoch = 0
+    resume = False
+    
+    if args.resume and os.path.exists(args.checkpoint_path):
+        start_epoch, trainer.best_loss = trainer.load_checkpoint(args.checkpoint_path, optimizer)
+        resume = True
+    
+    trainer.train_loop(args.epochs, start_epoch=start_epoch, resume=resume)
 
 
 if __name__ == '__main__':
@@ -346,6 +387,9 @@ if __name__ == '__main__':
     parser.add_argument('--dataset', type=str, default='input/rotate_dataset.pkl')
     parser.add_argument('--use_hair_loss', action='store_false')
     parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--epochs', type=int, default=1000)
+    parser.add_argument('--resume', action='store_true')
+    parser.add_argument('--checkpoint_path', type=str, default='checkpoint.pth')
     args = parser.parse_args()
 
     main(args)

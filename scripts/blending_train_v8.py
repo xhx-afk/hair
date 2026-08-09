@@ -24,7 +24,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from hair_swap_v8 import HairFast_v8, get_parser_v8
 from models.Encoders import ClipBlendingModel as BlendingModel
 from models.Net import Net
-from models.SG_IDCT_v16 import gaussian_blur2d
+from models.SG_IDCT_v16 import rgb_to_lab
 from models.face_parsing.model import BiSeNet, seg_mean, seg_std
 from utils.bicubic import BicubicDownSample
 from utils.image_utils import DilateErosion
@@ -54,23 +54,23 @@ def clean_zombies():
 USER_DATASET_PROFILE = "small"
 
 USER_DATASET_DIR_FFHQ = Path("input/blending_dataset_v8")
-USER_FACE_ROOT_FFHQ = Path("images/FFHQ")
-USER_SHAPE_ROOT_FFHQ = Path("images/FFHQ")
-USER_COLOR_ROOT_FFHQ = Path("images/FFHQ")
-USER_OUTPUT_DIR_FFHQ = Path("output/blending_train_v8")
+USER_FACE_ROOT_FFHQ = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FFHQ")
+USER_SHAPE_ROOT_FFHQ = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FFHQ")
+USER_COLOR_ROOT_FFHQ = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FFHQ")
+USER_OUTPUT_DIR_FFHQ = Path("output/blending_train_v8_v2")
 USER_VAL_SIZE_FFHQ = 512
 
 USER_DATASET_DIR_SMALL = Path("input/blending_dataset_v8_small")
-USER_FACE_ROOT_SMALL = Path("images/FFHQ_long")
-USER_SHAPE_ROOT_SMALL = Path("images/FFHQ_short")
-USER_COLOR_ROOT_SMALL = Path("images/FFHQ_color")
-USER_OUTPUT_DIR_SMALL = Path("output/blending_train_v8_small")
+USER_FACE_ROOT_SMALL = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FFHQ_long")
+USER_SHAPE_ROOT_SMALL = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FFHQ_short")
+USER_COLOR_ROOT_SMALL = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FFHQ_color")
+USER_OUTPUT_DIR_SMALL = Path("output/blending_train_v8_small_v2")
 USER_VAL_SIZE_SMALL = 64
 
 USER_DEVICE = "cuda"
 USER_RANDOM_SEED = 3407
-USER_BATCH_SIZE = 8
-USER_GRAD_ACCUM_STEPS = 2  # effective batch size = USER_BATCH_SIZE * USER_GRAD_ACCUM_STEPS
+USER_BATCH_SIZE = 16
+USER_GRAD_ACCUM_STEPS = 1  # effective batch size = USER_BATCH_SIZE * USER_GRAD_ACCUM_STEPS
 USER_NUM_WORKERS = 0
 USER_PIN_MEMORY = False
 USER_EPOCHS = 20
@@ -79,12 +79,35 @@ USER_WEIGHT_DECAY = 1e-6
 USER_GRAD_CLIP = 5.0
 USER_FACE_CLIP_LOSS_WEIGHT = 1.0
 USER_HAIR_CLIP_LOSS_WEIGHT = 0.25
+USER_HAIR_CHROMA_STATS_LOSS_WEIGHT = 16.0
+USER_HAIR_CHROMA_HIST_LOSS_WEIGHT = 5.0
+USER_HAIR_RGB_STATS_LOSS_WEIGHT = 2.0
+USER_HAIR_LAB_MEAN_LOSS_WEIGHT = 3.0
+USER_HAIR_LUMA_STYLE_LOSS_WEIGHT = 0.75
+USER_HAIR_LUMA_OVER_LOSS_WEIGHT = 1.10
+USER_HAIR_LUMA_OVER_STD = 1.35
+USER_HAIR_LUMA_OVER_MARGIN = 4.0
+USER_HAIR_LUMA_BASE_GRAD_LOSS_WEIGHT = 0.08
+USER_FACE_KEEP_L1_LOSS_WEIGHT = 1.0
+USER_REMOVE_KEEP_L1_LOSS_WEIGHT = 1.1
+USER_PROTECT_CHROMA_KEEP_LOSS_WEIGHT = 2.5
+USER_SKIN_CHROMA_KEEP_LOSS_WEIGHT = 10.0
+USER_SKIN_RGB_KEEP_LOSS_WEIGHT = 4.0
+USER_HAIR_VERTICAL_LAB_MEAN_LOSS_WEIGHT = 2.0
+USER_HAIR_VERTICAL_REGIONS = 3
+USER_HAIR_VERTICAL_MIN_PIXELS = 24.0
+USER_SAFE_HAIR_MIN_PIXELS = 64.0
+USER_REMOVE_BLOCK_IN_TARGET_HAIR = 0.12
+USER_FACE_NECK_COLOR_BLOCK = 0.96
+USER_TARGET_HAIR_NECK_OVERRIDE = 0.94
+USER_AUTHOR_COLOR_ALIGN_BATCH_PROB = 0.35
+USER_AUTHOR_ZERO_PREFIX_TRAIN = True
 
 USER_INIT_BLENDING_CKPT = "pretrained_models/Blending/checkpoint.pth"
 USER_FALLBACK_BLENDING_CKPT = "pretrained_models/Blending/checkpoint.pth"
 USER_CLIP_MODEL = "ViT-B/32"
 USER_USE_SATD_V8 = True
-USER_SATD_CHECKPOINT_V8 = "checkpoints/satd_small_best.pth"
+USER_SATD_CHECKPOINT_V8 = "/data/coding/HairFastGAN/HairFastGAN-main/best.pth"
 USER_SATD_BLEND_V8 = 0.34
 USER_SATD_BOUNDARY_V8 = 8
 USER_EQ8_REFERENCE_BLEND_V8 = 0.0
@@ -101,8 +124,9 @@ USER_LOG_IMAGE_COUNT = 30
 # Set this to output/.../checkpoints/last.pth or best.pth to continue training.
 USER_RESUME_CHECKPOINT = ""
 
-# Three-input objective: geometry comes from shape/SATD, while the color
-# reference only supplies Color_S and hair appearance.
+# Shape/SATD remains the validation and inference geometry. During training,
+# a minority of batches use the author's face->color alignment so the encoder
+# also learns reference color across the complete reference-hair extent.
 # ============================================================================
 
 
@@ -145,6 +169,14 @@ if USER_BATCH_SIZE < 1:
     raise RuntimeError("USER_BATCH_SIZE must be >= 1.")
 if USER_GRAD_ACCUM_STEPS < 1:
     raise RuntimeError("USER_GRAD_ACCUM_STEPS must be >= 1.")
+if not 0.0 <= USER_AUTHOR_COLOR_ALIGN_BATCH_PROB <= 1.0:
+    raise RuntimeError("USER_AUTHOR_COLOR_ALIGN_BATCH_PROB must be in [0, 1].")
+if not 0.0 <= USER_TARGET_HAIR_NECK_OVERRIDE <= 1.0:
+    raise RuntimeError("USER_TARGET_HAIR_NECK_OVERRIDE must be in [0, 1].")
+if USER_HAIR_VERTICAL_REGIONS < 1:
+    raise RuntimeError("USER_HAIR_VERTICAL_REGIONS must be >= 1.")
+if USER_HAIR_VERTICAL_MIN_PIXELS < 1:
+    raise RuntimeError("USER_HAIR_VERTICAL_MIN_PIXELS must be >= 1.")
 
 
 def set_seed(seed: int):
@@ -234,6 +266,10 @@ def build_remove_protect_mask(align_info: dict[str, object]) -> torch.Tensor:
         + 0.92 * delta_masks.get("M_remove_tail", zero).float()
         + 0.70 * delta_masks.get("M_face_strand_probe", zero).float()
         + 0.80 * delta_masks.get("M_remove_context", zero).float()
+        + 0.86 * delta_masks.get("M_body_preserve", zero).float()
+        + 0.72 * delta_masks.get("M_visible_body_anchor", zero).float()
+        + 0.60 * delta_masks.get("M_body_region", zero).float()
+        + 0.68 * delta_masks.get("M_cloth_region", zero).float()
         + 0.35 * delta_masks.get("M_boundary", zero).float()
     )
     return protect.clamp(0, 1)
@@ -300,19 +336,32 @@ def ensure_dataset_cache_v8(triplets: list[tuple[str, str, str]]):
     def mask_path(face_stem: str, ref_role: str, ref_stem: str) -> Path:
         return mask_dir / align_cache_name(face_stem, ref_role, ref_stem)
 
+    def mask_has_target_hair(path: Path) -> bool:
+        if not path.exists():
+            return False
+        try:
+            with np.load(path) as data:
+                return "target_hair" in data.files
+        except Exception:
+            return False
+
     def missing_required_cache() -> list[Path]:
         missing = []
         for face_name, shape_name, color_name in triplets:
+            shape_mask_path = mask_path(face_name, "shape", shape_name)
+            color_mask_path = mask_path(face_name, "color", color_name)
             required = [
                 fs_path("face", face_name),
                 fs_path("shape", shape_name),
                 fs_path("color", color_name),
                 align_path(face_name, "shape", shape_name),
                 align_path(face_name, "color", color_name),
-                mask_path(face_name, "shape", shape_name),
-                mask_path(face_name, "color", color_name),
             ]
             missing.extend(path for path in required if not path.exists())
+            if not mask_has_target_hair(shape_mask_path):
+                missing.append(shape_mask_path)
+            if not mask_has_target_hair(color_mask_path):
+                missing.append(color_mask_path)
         return missing
 
     if not USER_BUILD_CACHE_WITH_CURRENT_SATD:
@@ -320,8 +369,9 @@ def ensure_dataset_cache_v8(triplets: list[tuple[str, str, str]]):
         if missing:
             preview = "\n".join(f"  {path}" for path in missing[:10])
             raise RuntimeError(
-                "Role-scoped v8 blending cache is missing. The old unscoped cache can mix "
-                "FFHQ_long/FFHQ_short/FFHQ_color entries with the same stem, so it is unsafe. "
+                "Role-scoped v8 blending cache is missing or stale. The Masks cache must include "
+                "target_hair for long-hair color supervision, and the old unscoped cache can mix "
+                "FFHQ_long/FFHQ_short/FFHQ_color entries with the same stem. "
                 "Run scripts/blending_gen_v8.py again or set USER_BUILD_CACHE_WITH_CURRENT_SATD=True "
                 f"to rebuild it.\nMissing examples:\n{preview}"
             )
@@ -332,8 +382,8 @@ def ensure_dataset_cache_v8(triplets: list[tuple[str, str, str]]):
     for face_name, shape_name, color_name in triplets:
         need_align_shape = USER_FORCE_REFRESH_ALIGN_CACHE or (not align_path(face_name, "shape", shape_name).exists())
         need_align_color = USER_FORCE_REFRESH_ALIGN_CACHE or (not align_path(face_name, "color", color_name).exists())
-        need_mask_shape = USER_FORCE_REFRESH_ALIGN_CACHE or (not mask_path(face_name, "shape", shape_name).exists())
-        need_mask_color = USER_FORCE_REFRESH_ALIGN_CACHE or (not mask_path(face_name, "color", color_name).exists())
+        need_mask_shape = USER_FORCE_REFRESH_ALIGN_CACHE or (not mask_has_target_hair(mask_path(face_name, "shape", shape_name)))
+        need_mask_color = USER_FORCE_REFRESH_ALIGN_CACHE or (not mask_has_target_hair(mask_path(face_name, "color", color_name)))
         need_face_fs = not fs_path("face", face_name).exists()
         need_shape_fs = not fs_path("shape", shape_name).exists()
         need_color_fs = not fs_path("color", color_name).exists()
@@ -383,19 +433,21 @@ def ensure_dataset_cache_v8(triplets: list[tuple[str, str, str]]):
                 align_cache_name(face_name, "color", color_name),
                 latent_F=align_color["latent_F_align"],
             )
-        if USER_FORCE_REFRESH_ALIGN_CACHE or (not mask_path(face_name, "shape", shape_name).exists()):
+        if USER_FORCE_REFRESH_ALIGN_CACHE or (not mask_has_target_hair(mask_path(face_name, "shape", shape_name))):
             save_latents(
                 ACTIVE_DATASET_DIR,
                 "Masks",
                 align_cache_name(face_name, "shape", shape_name),
                 remove_mask=build_remove_protect_mask(align_shape),
+                target_hair=align_shape["HM_X"].float(),
             )
-        if USER_FORCE_REFRESH_ALIGN_CACHE or (not mask_path(face_name, "color", color_name).exists()):
+        if USER_FORCE_REFRESH_ALIGN_CACHE or (not mask_has_target_hair(mask_path(face_name, "color", color_name))):
             save_latents(
                 ACTIVE_DATASET_DIR,
                 "Masks",
                 align_cache_name(face_name, "color", color_name),
                 remove_mask=build_remove_protect_mask(align_color),
+                target_hair=align_color["HM_X"].float(),
             )
 
     del hair_fast
@@ -424,6 +476,30 @@ def mask_to_preview(mask: torch.Tensor) -> torch.Tensor:
     return mask * 2 - 1
 
 
+PARSING_HAIR_LABEL = 10
+PARSING_HAT_LABEL = 11
+PARSING_FACE_PROTECT_LABELS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 12)
+PARSING_NECK_PROTECT_LABELS = (13, 14)
+PARSING_BODY_PROTECT_LABELS = (15,)
+PARSING_SKIN_PROTECT_LABELS = PARSING_FACE_PROTECT_LABELS + PARSING_NECK_PROTECT_LABELS
+PARSING_SUBJECT_PROTECT_LABELS = PARSING_SKIN_PROTECT_LABELS + PARSING_BODY_PROTECT_LABELS
+
+
+def parsing_label_mask(parsing_mask: torch.Tensor, labels: tuple[int, ...]) -> torch.Tensor:
+    mask = torch.zeros_like(parsing_mask, dtype=torch.bool)
+    for label in labels:
+        mask |= parsing_mask == label
+    return mask.float()
+
+
+def dilate_mask(mask: torch.Tensor, width: int) -> torch.Tensor:
+    if width <= 0:
+        return mask.float().clamp(0, 1)
+    if mask.dim() == 3:
+        mask = mask.unsqueeze(1)
+    return tnf.max_pool2d(mask.float(), kernel_size=2 * width + 1, stride=1, padding=width).clamp(0, 1)
+
+
 class MaskPrepHelper:
     def __init__(self, device: torch.device):
         self.device = device
@@ -450,14 +526,44 @@ class MaskPrepHelper:
     def generate_mask(self, image: torch.Tensor, return_keep: bool = False):
         image_512 = (self.downsample_512((image + 1) / 2) - seg_mean) / seg_std
         down_seg, _, _ = self.seg(image_512)
-        current_mask = torch.argmax(down_seg, dim=1).long().float()
-        hair_mask = torch.where(current_mask == 10, torch.ones_like(current_mask), torch.zeros_like(current_mask))
+        current_mask = torch.argmax(down_seg, dim=1).long()
+        hair_mask = torch.where(
+            current_mask == PARSING_HAIR_LABEL,
+            torch.ones_like(current_mask, dtype=torch.float32),
+            torch.zeros_like(current_mask, dtype=torch.float32),
+        )
         hair_mask = tnf.interpolate(hair_mask.unsqueeze(1), size=(256, 256), mode="nearest")
         hair_mask_dilate, hair_mask_erode = self.dilate_erosion.mask(hair_mask)
         if return_keep:
-            non_hair_subject = ((current_mask > 0) & (current_mask != 10)).float()
+            non_hair_subject = (
+                (current_mask > 0)
+                & (current_mask != PARSING_HAIR_LABEL)
+                & (current_mask != PARSING_HAT_LABEL)
+            ).float()
+            subject_guard = parsing_label_mask(current_mask, PARSING_SUBJECT_PROTECT_LABELS)
+            skin_guard = parsing_label_mask(current_mask, PARSING_SKIN_PROTECT_LABELS)
+            face_guard = parsing_label_mask(current_mask, PARSING_FACE_PROTECT_LABELS)
+            neck_guard = parsing_label_mask(current_mask, PARSING_NECK_PROTECT_LABELS)
+
             non_hair_subject = tnf.interpolate(non_hair_subject.unsqueeze(1), size=(256, 256), mode="nearest")
-            return hair_mask_dilate, hair_mask_erode, non_hair_subject.clamp(0, 1)
+            subject_guard = tnf.interpolate(subject_guard.unsqueeze(1), size=(256, 256), mode="nearest")
+            skin_guard = tnf.interpolate(skin_guard.unsqueeze(1), size=(256, 256), mode="nearest")
+            face_guard = tnf.interpolate(face_guard.unsqueeze(1), size=(256, 256), mode="nearest")
+            neck_guard = tnf.interpolate(neck_guard.unsqueeze(1), size=(256, 256), mode="nearest")
+
+            subject_guard = dilate_mask(subject_guard, 2)
+            skin_guard = dilate_mask(skin_guard, 2)
+            face_guard = dilate_mask(face_guard, 2)
+            neck_guard = dilate_mask(neck_guard, 2)
+            return (
+                hair_mask_dilate,
+                hair_mask_erode,
+                non_hair_subject.clamp(0, 1),
+                subject_guard.clamp(0, 1),
+                skin_guard.clamp(0, 1),
+                face_guard.clamp(0, 1),
+                neck_guard.clamp(0, 1),
+            )
         return hair_mask_dilate, hair_mask_erode
 
 
@@ -467,18 +573,42 @@ def prepare_item(exp, dataset_dir: Path, face_root: Path, color_root: Path):
     try:
         color_s = torch.from_numpy(np.load(dataset_dir / "FS" / fs_cache_name("color", color_name))["latent_in"]).squeeze(0)
         align_s = torch.from_numpy(np.load(dataset_dir / "FS" / fs_cache_name("face", face_name))["latent_in"]).squeeze(0)
-        align_f = torch.from_numpy(
+        align_f_shape = torch.from_numpy(
             np.load(dataset_dir / "Align" / align_cache_name(face_name, "shape", shape_name))["latent_F"]
         ).squeeze(0)
-        remove_mask = torch.from_numpy(
-            np.load(dataset_dir / "Masks" / align_cache_name(face_name, "shape", shape_name))["remove_mask"]
+        with np.load(dataset_dir / "Masks" / align_cache_name(face_name, "shape", shape_name)) as mask_data:
+            remove_mask_shape = torch.from_numpy(np.array(mask_data["remove_mask"])).squeeze(0)
+            if "target_hair" in mask_data.files:
+                target_hair_shape = torch.from_numpy(np.array(mask_data["target_hair"])).squeeze(0)
+            else:
+                target_hair_shape = torch.zeros_like(remove_mask_shape)
+
+        align_f_color = torch.from_numpy(
+            np.load(dataset_dir / "Align" / align_cache_name(face_name, "color", color_name))["latent_F"]
         ).squeeze(0)
+        with np.load(dataset_dir / "Masks" / align_cache_name(face_name, "color", color_name)) as mask_data:
+            remove_mask_color = torch.from_numpy(np.array(mask_data["remove_mask"])).squeeze(0)
+            if "target_hair" in mask_data.files:
+                target_hair_color = torch.from_numpy(np.array(mask_data["target_hair"])).squeeze(0)
+            else:
+                target_hair_color = torch.zeros_like(remove_mask_color)
 
         with Image.open(find_image_path(color_root, color_name)) as color_image:
             color_i = T.functional.normalize(T.functional.to_tensor(color_image.convert("RGB")), [0.5], [0.5])
         with Image.open(find_image_path(face_root, face_name)) as face_image:
             face_i = T.functional.normalize(T.functional.to_tensor(face_image.convert("RGB")), [0.5], [0.5])
-        return color_s, align_s, align_f, remove_mask, color_i, face_i
+        return (
+            color_s,
+            align_s,
+            align_f_shape,
+            remove_mask_shape,
+            target_hair_shape,
+            align_f_color,
+            remove_mask_color,
+            target_hair_color,
+            color_i,
+            face_i,
+        )
     except Exception as exc:
         print(exc, file=sys.stderr)
         return None
@@ -538,15 +668,47 @@ class BlendingTrainerV8:
         if USER_USE_FID and Path(USER_FID_DATASET).exists():
             self.fid_calc = get_fid_calc(USER_FID_CACHE, str(USER_FID_DATASET), device=self.device)
 
-    def prepare_batch(self, batch):
-        color_s, align_s, align_f, remove_mask, color_i, face_i = [item.to(self.device, non_blocking=True) for item in batch]
+    def prepare_batch(self, batch, use_author_color_align: bool = False):
+        (
+            color_s,
+            align_s,
+            align_f_shape,
+            remove_mask_shape,
+            target_hair_shape,
+            align_f_color,
+            remove_mask_color,
+            target_hair_color,
+            color_i,
+            face_i,
+        ) = batch
+        align_f = align_f_color if use_author_color_align else align_f_shape
+        remove_mask = remove_mask_color if use_author_color_align else remove_mask_shape
+        target_hair = target_hair_color if use_author_color_align else target_hair_shape
+        color_s, align_s, align_f, remove_mask, target_hair, color_i, face_i = [
+            item.to(self.device, non_blocking=True)
+            for item in (color_s, align_s, align_f, remove_mask, target_hair, color_i, face_i)
+        ]
         remove_mask = remove_mask.float().clamp(0, 1)
         if remove_mask.dim() == 3:
             remove_mask = remove_mask.unsqueeze(1)
+        target_hair = target_hair.float().clamp(0, 1)
+        if target_hair.dim() == 3:
+            target_hair = target_hair.unsqueeze(1)
 
         with torch.no_grad():
             hm_3d, hm_3e = self.helper.generate_mask(color_i)
-            hm_1d, _ = self.helper.generate_mask(face_i)
+            (
+                hm_1d,
+                _,
+                source_keep_mask,
+                source_subject_guard,
+                source_skin_guard,
+                source_face_guard,
+                source_neck_guard,
+            ) = self.helper.generate_mask(
+                face_i,
+                return_keep=True,
+            )
             i_x, _ = self.helper.net.generator(
                 [align_s],
                 input_is_latent=True,
@@ -555,14 +717,95 @@ class BlendingTrainerV8:
                 end_layer=8,
                 layer_in=align_f,
             )
-            hm_xd, _, face_keep_mask = self.helper.generate_mask(i_x, return_keep=True)
+            (
+                hm_xd,
+                hm_xe,
+                face_keep_mask,
+                target_subject_guard,
+                target_skin_guard,
+                target_face_guard,
+                target_neck_guard,
+            ) = self.helper.generate_mask(
+                i_x,
+                return_keep=True,
+            )
             i_x_256 = self.helper.downsample_256(i_x)
             face_i_256 = self.helper.downsample_256(face_i)
             color_i_256 = self.helper.downsample_256(color_i)
 
-        target_mask = (1 - hm_1d) * (1 - hm_3d) * (1 - hm_xd)
-        satd_protect_mask = (1.0 - hm_xd).clamp(0, 1)
-        color_transfer_mask = hm_xd.clamp(0, 1)
+        cached_hair_d, cached_hair_e = self.helper.dilate_erosion.mask(target_hair)
+        has_cached_hair = target_hair.flatten(1).sum(dim=1) >= USER_SAFE_HAIR_MIN_PIXELS
+        target_hair_d = torch.where(
+            has_cached_hair.view(-1, 1, 1, 1),
+            torch.maximum(hm_xd, cached_hair_d),
+            hm_xd,
+        ).clamp(0, 1)
+        target_hair_e = torch.where(
+            has_cached_hair.view(-1, 1, 1, 1),
+            torch.maximum(hm_xe, cached_hair_e),
+            hm_xe,
+        ).clamp(0, 1)
+
+        target_mask = (1 - hm_1d) * (1 - hm_3d) * (1 - target_hair_d)
+        neck_hair_override = (USER_TARGET_HAIR_NECK_OVERRIDE * target_hair_e).clamp(0, 1)
+        target_neck_visible = (target_neck_guard * (1.0 - neck_hair_override)).clamp(0, 1)
+        source_neck_visible = (source_neck_guard * (1.0 - neck_hair_override)).clamp(0, 1)
+        skin_color_block = (
+            target_face_guard
+            + target_neck_visible
+            + 0.55 * source_face_guard
+            + 0.55 * source_neck_visible
+        ).clamp(0, 1)
+        skin_protect_mask = (
+            target_face_guard
+            + target_neck_visible
+            + 0.45 * source_face_guard
+            + 0.45 * source_neck_visible
+        ).clamp(0, 1)
+        remove_color_block = (
+            remove_mask * (1.0 - target_hair_d)
+            + USER_REMOVE_BLOCK_IN_TARGET_HAIR * remove_mask * target_hair_d
+        ).clamp(0, 1)
+        color_transfer_eroded = (
+            target_hair_e
+            * (1.0 - remove_color_block)
+            * (1.0 - USER_FACE_NECK_COLOR_BLOCK * skin_color_block)
+        ).clamp(0, 1)
+        color_transfer_core = (
+            ((0.72 * target_hair_e) + (0.28 * target_hair_d))
+            * (1.0 - remove_color_block)
+            * (1.0 - USER_FACE_NECK_COLOR_BLOCK * skin_color_block)
+        ).clamp(0, 1)
+        color_transfer_fallback = (
+            target_hair_d
+            * (1.0 - 0.45 * remove_color_block)
+            * (1.0 - USER_FACE_NECK_COLOR_BLOCK * skin_color_block)
+        ).clamp(0, 1)
+        needs_fallback = color_transfer_eroded.flatten(1).sum(dim=1) < USER_SAFE_HAIR_MIN_PIXELS
+        color_transfer_mask = torch.where(
+            needs_fallback.view(-1, 1, 1, 1),
+            color_transfer_fallback,
+            color_transfer_core,
+        ).clamp(0, 1)
+        subject_protect_mask = (
+            (
+                face_keep_mask
+                + source_keep_mask
+                + target_subject_guard
+                + 0.60 * source_subject_guard
+                + target_skin_guard
+                + 0.50 * source_skin_guard
+            )
+            * (1.0 - color_transfer_mask)
+        ).clamp(0, 1)
+        skin_protect_mask = (skin_protect_mask * (1.0 - color_transfer_mask)).clamp(0, 1)
+        satd_protect_mask = (
+            remove_color_block
+            + subject_protect_mask
+            + skin_protect_mask
+            + 0.35 * target_mask
+            + 0.25 * (1.0 - target_hair_d) * (1.0 - hm_3e)
+        ).clamp(0, 1)
         color_reference_mask = hm_3e.clamp(0, 1)
 
         valid = color_reference_mask.flatten(1).any(dim=1) & color_transfer_mask.flatten(1).any(dim=1)
@@ -578,34 +821,294 @@ class BlendingTrainerV8:
             i_x_256[valid],
             target_mask[valid],
             satd_protect_mask[valid],
-            remove_mask[valid],
+            remove_color_block[valid],
             color_transfer_mask[valid],
             face_keep_mask[valid],
+            skin_protect_mask[valid],
             hm_3e[valid],
             color_reference_mask[valid],
         )
 
-    def calc_loss(self, i_gen, i_face, i_color, mask_face, mask_hair, gen_hair=None, *_, **__):
-        del gen_hair
-        mask_face = mask_face.float().clamp(0, 1)
-        mask_hair = mask_hair.float().clamp(0, 1)
-        if mask_face.size(1) == 1 and i_gen.size(1) != 1:
-            mask_face = mask_face.expand(-1, i_gen.size(1), -1, -1)
-        if mask_hair.size(1) == 1 and i_gen.size(1) != 1:
-            mask_hair = mask_hair.expand(-1, i_gen.size(1), -1, -1)
+    @staticmethod
+    def masked_l1(source: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        mask = mask.float().clamp(0, 1)
+        denom = mask.sum().clamp_min(1.0) * source.size(1)
+        return (torch.abs(source - target) * mask).sum() / denom
+
+    @staticmethod
+    def masked_mean_std(image: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        mask = mask.float().clamp(0, 1)
+        if mask.size(1) == 1 and image.size(1) != 1:
+            mask = mask.expand(-1, image.size(1), -1, -1)
+        denom = mask.flatten(2).sum(dim=2).clamp_min(1.0)
+        mean = (image * mask).flatten(2).sum(dim=2) / denom
+        centered = image - mean[:, :, None, None]
+        var = (centered.square() * mask).flatten(2).sum(dim=2) / denom
+        return mean, torch.sqrt(var.clamp_min(1e-8))
+
+    def masked_pair_stats_loss(
+        self,
+        pred_features: torch.Tensor,
+        pred_mask: torch.Tensor,
+        target_features: torch.Tensor,
+        target_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        pred_mean, pred_std = self.masked_mean_std(pred_features, pred_mask)
+        target_mean, target_std = self.masked_mean_std(target_features, target_mask)
+        return tnf.l1_loss(pred_mean, target_mean) + tnf.l1_loss(pred_std, target_std)
+
+    def masked_pair_mean_loss(
+        self,
+        pred_features: torch.Tensor,
+        pred_mask: torch.Tensor,
+        target_features: torch.Tensor,
+        target_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        pred_mean, _ = self.masked_mean_std(pred_features, pred_mask)
+        target_mean, _ = self.masked_mean_std(target_features, target_mask)
+        return tnf.l1_loss(pred_mean, target_mean)
+
+    def masked_vertical_pair_mean_loss(
+        self,
+        pred_features: torch.Tensor,
+        pred_mask: torch.Tensor,
+        target_features: torch.Tensor,
+        target_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        regions = max(int(USER_HAIR_VERTICAL_REGIONS), 1)
+        min_pixels = float(USER_HAIR_VERTICAL_MIN_PIXELS)
+        pred_mask = pred_mask.float().clamp(0, 1)
+        target_mask = target_mask.float().clamp(0, 1)
+
+        def normalized_vertical_position(mask: torch.Tensor) -> torch.Tensor:
+            height = mask.size(2)
+            rows = torch.arange(height, device=mask.device, dtype=mask.dtype).view(1, 1, height, 1)
+            present = mask > 0.05
+            y_min = torch.where(present, rows, torch.full_like(rows, float(height))).flatten(2).min(dim=2)[0]
+            y_max = torch.where(present, rows, torch.full_like(rows, -1.0)).flatten(2).max(dim=2)[0] + 1.0
+            y_min = y_min[:, :, None, None]
+            span = (y_max[:, :, None, None] - y_min).clamp_min(1.0)
+            return (rows - y_min) / span
+
+        pred_position = normalized_vertical_position(pred_mask)
+        target_position = normalized_vertical_position(target_mask)
+        total_loss = pred_features.sum() * 0.0
+        valid_regions = pred_features.new_zeros(())
+
+        for region_idx in range(regions):
+            lower = float(region_idx) / regions
+            upper = float(region_idx + 1) / regions
+            pred_region_mask = pred_mask * ((pred_position >= lower) & (pred_position < upper)).float()
+            target_region_mask = target_mask * ((target_position >= lower) & (target_position < upper)).float()
+            pred_mean, _ = self.masked_mean_std(pred_features, pred_region_mask)
+            target_mean, _ = self.masked_mean_std(target_features, target_region_mask)
+            valid = (
+                (pred_region_mask.flatten(1).sum(dim=1) >= min_pixels)
+                & (target_region_mask.flatten(1).sum(dim=1) >= min_pixels)
+            ).float()
+            per_sample_loss = torch.abs(pred_mean - target_mean).mean(dim=1)
+            total_loss = total_loss + (per_sample_loss * valid).sum()
+            valid_regions = valid_regions + valid.sum()
+
+        return total_loss / valid_regions.clamp_min(1.0)
+
+    @staticmethod
+    def masked_soft_histogram(
+        values: torch.Tensor,
+        mask: torch.Tensor,
+        bins: int,
+        value_min: float,
+        value_max: float,
+    ) -> torch.Tensor:
+        values = values.flatten(2)
+        mask = mask.float().clamp(0, 1)
+        if mask.size(1) == 1 and values.size(1) != 1:
+            mask = mask.expand(-1, values.size(1), -1, -1)
+        mask = mask.flatten(2)
+
+        centers = torch.linspace(value_min, value_max, steps=bins, device=values.device, dtype=values.dtype)
+        centers = centers.view(1, 1, 1, bins)
+        sigma = (value_max - value_min) / max(bins - 1, 1)
+        weights = torch.exp(-0.5 * ((values.unsqueeze(-1) - centers) / max(sigma, 1e-6)).square())
+        weights = weights * mask.unsqueeze(-1)
+        hist = weights.sum(dim=2)
+        return hist / hist.sum(dim=2, keepdim=True).clamp_min(1e-6)
+
+    def masked_pair_hist_loss(
+        self,
+        pred_features: torch.Tensor,
+        pred_mask: torch.Tensor,
+        target_features: torch.Tensor,
+        target_mask: torch.Tensor,
+        bins: int,
+        value_min: float,
+        value_max: float,
+    ) -> torch.Tensor:
+        pred_hist = self.masked_soft_histogram(pred_features, pred_mask, bins, value_min, value_max)
+        target_hist = self.masked_soft_histogram(target_features, target_mask, bins, value_min, value_max)
+        return tnf.l1_loss(pred_hist, target_hist)
+
+    def masked_luma_over_loss(
+        self,
+        pred_luma: torch.Tensor,
+        pred_mask: torch.Tensor,
+        target_luma: torch.Tensor,
+        target_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        target_mean, target_std = self.masked_mean_std(target_luma, target_mask)
+        upper = target_mean[:, :, None, None] + USER_HAIR_LUMA_OVER_STD * target_std[:, :, None, None]
+        upper = upper + USER_HAIR_LUMA_OVER_MARGIN
+        pred_mask = pred_mask.float().clamp(0, 1)
+        denom = pred_mask.sum().clamp_min(1.0)
+        return (torch.relu(pred_luma - upper) * pred_mask).sum() / denom
+
+    @staticmethod
+    def masked_gradient_l1(source: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        mask = mask.float().clamp(0, 1)
+        if mask.size(1) == 1 and source.size(1) != 1:
+            mask = mask.expand(-1, source.size(1), -1, -1)
+
+        source_dx = source[:, :, :, 1:] - source[:, :, :, :-1]
+        target_dx = target[:, :, :, 1:] - target[:, :, :, :-1]
+        mask_x = mask[:, :, :, 1:] * mask[:, :, :, :-1]
+
+        source_dy = source[:, :, 1:, :] - source[:, :, :-1, :]
+        target_dy = target[:, :, 1:, :] - target[:, :, :-1, :]
+        mask_y = mask[:, :, 1:, :] * mask[:, :, :-1, :]
+
+        loss_x = (torch.abs(source_dx - target_dx) * mask_x).sum() / mask_x.sum().clamp_min(1.0)
+        loss_y = (torch.abs(source_dy - target_dy) * mask_y).sum() / mask_y.sum().clamp_min(1.0)
+        return loss_x + loss_y
+
+    def calc_loss(
+        self,
+        i_gen,
+        i_face,
+        i_color,
+        i_base,
+        mask_face,
+        mask_gen_hair,
+        mask_color_ref,
+        satd_protect_mask,
+        face_keep_mask,
+        skin_protect_mask,
+        remove_mask,
+    ):
+        mask_gen_hair = mask_gen_hair.float().clamp(0, 1)
+        mask_color_ref = mask_color_ref.float().clamp(0, 1)
+        satd_protect_mask = satd_protect_mask.float().clamp(0, 1)
+        face_keep_mask = face_keep_mask.float().clamp(0, 1)
+        skin_protect_mask = skin_protect_mask.float().clamp(0, 1)
+        remove_mask = remove_mask.float().clamp(0, 1)
 
         gen_face_embed = self.model.get_image_embed(i_gen * mask_face)
         face_embed = self.model.get_image_embed(i_face * mask_face)
         face_loss = (1 - tnf.cosine_similarity(gen_face_embed, face_embed)).mean()
 
-        gen_hair_embed = self.model.get_image_embed(i_gen * mask_hair)
-        color_hair_embed = self.model.get_image_embed(i_color * mask_hair)
+        gen_hair_embed = self.model.get_image_embed(i_gen * mask_gen_hair)
+        color_hair_embed = self.model.get_image_embed(i_color * mask_color_ref)
         hair_loss = (1 - tnf.cosine_similarity(gen_hair_embed, color_hair_embed)).mean()
 
-        total_loss = USER_FACE_CLIP_LOSS_WEIGHT * face_loss + USER_HAIR_CLIP_LOSS_WEIGHT * hair_loss
+        gen_lab = rgb_to_lab(i_gen)
+        color_lab = rgb_to_lab(i_color)
+        base_lab = rgb_to_lab(i_base)
+        gen_luma = gen_lab[:, 0:1]
+        color_luma = color_lab[:, 0:1]
+        base_luma = base_lab[:, 0:1]
+        gen_chroma = gen_lab[:, 1:3]
+        color_chroma = color_lab[:, 1:3]
+        base_chroma = base_lab[:, 1:3]
+        gen_rgb01 = ((i_gen + 1.0) * 0.5).clamp(0, 1)
+        color_rgb01 = ((i_color + 1.0) * 0.5).clamp(0, 1)
+
+        hair_chroma_stats_loss = self.masked_pair_stats_loss(
+            gen_chroma,
+            mask_gen_hair,
+            color_chroma,
+            mask_color_ref,
+        )
+        hair_chroma_hist_loss = self.masked_pair_hist_loss(
+            gen_chroma,
+            mask_gen_hair,
+            color_chroma,
+            mask_color_ref,
+            bins=12,
+            value_min=-110.0,
+            value_max=110.0,
+        )
+        hair_rgb_stats_loss = self.masked_pair_stats_loss(
+            gen_rgb01,
+            mask_gen_hair,
+            color_rgb01,
+            mask_color_ref,
+        )
+        hair_lab_mean_loss = self.masked_pair_mean_loss(
+            gen_lab,
+            mask_gen_hair,
+            color_lab,
+            mask_color_ref,
+        )
+        hair_vertical_lab_mean_loss = self.masked_vertical_pair_mean_loss(
+            gen_lab,
+            mask_gen_hair,
+            color_lab,
+            mask_color_ref,
+        )
+        hair_luma_style_loss = self.masked_pair_stats_loss(
+            gen_luma,
+            mask_gen_hair,
+            color_luma,
+            mask_color_ref,
+        )
+        hair_luma_over_loss = self.masked_luma_over_loss(
+            gen_luma,
+            mask_gen_hair,
+            color_luma,
+            mask_color_ref,
+        )
+        hair_luma_base_grad_loss = self.masked_gradient_l1(gen_luma, base_luma, mask_gen_hair)
+
+        face_keep_region = (face_keep_mask * satd_protect_mask).clamp(0, 1)
+        protect_region = (face_keep_region + remove_mask).clamp(0, 1)
+        face_keep_loss = self.masked_l1(i_gen, i_base, face_keep_region)
+        remove_keep_loss = self.masked_l1(i_gen, i_base, remove_mask)
+        protect_chroma_keep_loss = self.masked_l1(gen_chroma, base_chroma, protect_region)
+        skin_chroma_keep_loss = self.masked_l1(gen_chroma, base_chroma, skin_protect_mask)
+        skin_rgb_keep_loss = self.masked_l1(i_gen, i_base, skin_protect_mask)
+
+        total_loss = (
+            USER_FACE_CLIP_LOSS_WEIGHT * face_loss
+            + USER_HAIR_CLIP_LOSS_WEIGHT * hair_loss
+            + USER_HAIR_CHROMA_STATS_LOSS_WEIGHT * hair_chroma_stats_loss
+            + USER_HAIR_CHROMA_HIST_LOSS_WEIGHT * hair_chroma_hist_loss
+            + USER_HAIR_RGB_STATS_LOSS_WEIGHT * hair_rgb_stats_loss
+            + USER_HAIR_LAB_MEAN_LOSS_WEIGHT * hair_lab_mean_loss
+            + USER_HAIR_VERTICAL_LAB_MEAN_LOSS_WEIGHT * hair_vertical_lab_mean_loss
+            + USER_HAIR_LUMA_STYLE_LOSS_WEIGHT * hair_luma_style_loss
+            + USER_HAIR_LUMA_OVER_LOSS_WEIGHT * hair_luma_over_loss
+            + USER_HAIR_LUMA_BASE_GRAD_LOSS_WEIGHT * hair_luma_base_grad_loss
+            + USER_FACE_KEEP_L1_LOSS_WEIGHT * face_keep_loss
+            + USER_REMOVE_KEEP_L1_LOSS_WEIGHT * remove_keep_loss
+            + USER_PROTECT_CHROMA_KEEP_LOSS_WEIGHT * protect_chroma_keep_loss
+            + USER_SKIN_CHROMA_KEEP_LOSS_WEIGHT * skin_chroma_keep_loss
+            + USER_SKIN_RGB_KEEP_LOSS_WEIGHT * skin_rgb_keep_loss
+        )
         return total_loss, {
             "face_loss": face_loss,
             "hair_loss": hair_loss,
+            "hair_chroma_stats": hair_chroma_stats_loss,
+            "hair_chroma_hist": hair_chroma_hist_loss,
+            "hair_rgb_stats": hair_rgb_stats_loss,
+            "hair_lab_mean": hair_lab_mean_loss,
+            "hair_vertical_lab_mean": hair_vertical_lab_mean_loss,
+            "hair_luma_style": hair_luma_style_loss,
+            "hair_luma_over": hair_luma_over_loss,
+            "hair_luma_base_grad": hair_luma_base_grad_loss,
+            "face_keep_l1": face_keep_loss,
+            "remove_keep_l1": remove_keep_loss,
+            "protect_chroma_keep": protect_chroma_keep_loss,
+            "skin_chroma_keep": skin_chroma_keep_loss,
+            "skin_rgb_keep": skin_rgb_keep_loss,
             "loss": total_loss,
         }
 
@@ -654,6 +1157,17 @@ class BlendingTrainerV8:
         )
         return start_epoch
 
+    @staticmethod
+    def build_generator_latent(align_s: torch.Tensor, blend_s: torch.Tensor) -> torch.Tensor:
+        # This matches the author's training code. With start_layer=4 the
+        # prefix is not rendered, but keeping the contract explicit avoids
+        # accidental dependence if the generator call changes later.
+        if USER_AUTHOR_ZERO_PREFIX_TRAIN:
+            prefix = torch.zeros_like(align_s[:, :6])
+        else:
+            prefix = align_s[:, :6]
+        return torch.cat((prefix, blend_s), dim=1)
+
     def train_one_epoch(self, epoch: int):
         self.model.train()
         running_loss = 0.0
@@ -663,7 +1177,11 @@ class BlendingTrainerV8:
         self.optimizer.zero_grad(set_to_none=True)
         progress = tqdm(self.train_loader, desc=f"Blend train {epoch + 1}/{USER_EPOCHS}", leave=False)
         for batch in progress:
-            prepared = self.prepare_batch(batch)
+            use_author_color_align = (
+                USER_AUTHOR_COLOR_ALIGN_BATCH_PROB > 0
+                and random.random() < USER_AUTHOR_COLOR_ALIGN_BATCH_PROB
+            )
+            prepared = self.prepare_batch(batch, use_author_color_align=use_author_color_align)
             if prepared is None:
                 continue
 
@@ -676,16 +1194,17 @@ class BlendingTrainerV8:
                 i_x_256,
                 target_mask,
                 satd_protect_mask,
-                _remove_mask,
+                remove_mask,
                 color_transfer_mask,
                 face_keep_mask,
+                skin_protect_mask,
                 hm_3e,
                 color_ref_mask,
             ) = prepared
             bsz = color_s.size(0)
 
             blend_s = self.model(align_s[:, 6:], color_s[:, 6:], face_i * target_mask, color_i * hm_3e)
-            latent_in = torch.cat((torch.zeros(bsz, 6, 512, device=self.device), blend_s), axis=1)
+            latent_in = self.build_generator_latent(align_s, blend_s)
             i_g, _ = self.helper.net.generator(
                 [latent_in],
                 input_is_latent=True,
@@ -694,14 +1213,18 @@ class BlendingTrainerV8:
                 end_layer=8,
                 layer_in=align_f,
             )
-            i_g_256 = self.helper.downsample_256(i_g)
             loss, loss_info = self.calc_loss(
-                i_g_256,
+                self.helper.downsample_256(i_g),
                 face_i,
                 color_i,
+                i_x_256,
                 target_mask,
-                hm_3e,
-                hm_3e,
+                color_transfer_mask,
+                color_ref_mask,
+                satd_protect_mask,
+                face_keep_mask,
+                skin_protect_mask,
+                remove_mask,
             )
 
             (loss / self.grad_accum_steps).backward()
@@ -717,8 +1240,13 @@ class BlendingTrainerV8:
             running_steps += 1
             progress.set_postfix(
                 loss=float(loss.item()),
-                face=float(loss_info["face_loss"].item()),
-                hair=float(loss_info["hair_loss"].item()),
+                chroma=float(loss_info["hair_chroma_stats"].item()),
+                hist=float(loss_info["hair_chroma_hist"].item()),
+                rgb=float(loss_info["hair_rgb_stats"].item()),
+                over=float(loss_info["hair_luma_over"].item()),
+                vertical=float(loss_info["hair_vertical_lab_mean"].item()),
+                skin=float(loss_info["skin_chroma_keep"].item()),
+                branch="color" if use_author_color_align else "shape",
                 grad=last_grad_norm,
                 accum=f"{accumulated_batches}/{self.grad_accum_steps}",
             )
@@ -741,6 +1269,19 @@ class BlendingTrainerV8:
         total_losses = {
             "face_loss": 0.0,
             "hair_loss": 0.0,
+            "hair_chroma_stats": 0.0,
+            "hair_chroma_hist": 0.0,
+            "hair_rgb_stats": 0.0,
+            "hair_lab_mean": 0.0,
+            "hair_vertical_lab_mean": 0.0,
+            "hair_luma_style": 0.0,
+            "hair_luma_over": 0.0,
+            "hair_luma_base_grad": 0.0,
+            "face_keep_l1": 0.0,
+            "remove_keep_l1": 0.0,
+            "protect_chroma_keep": 0.0,
+            "skin_chroma_keep": 0.0,
+            "skin_rgb_keep": 0.0,
             "loss": 0.0,
         }
         total_steps = 0
@@ -748,7 +1289,7 @@ class BlendingTrainerV8:
         preview_rows = []
 
         for batch in tqdm(self.val_loader, desc=f"Blend val {epoch + 1}/{USER_EPOCHS}", leave=False):
-            prepared = self.prepare_batch(batch)
+            prepared = self.prepare_batch(batch, use_author_color_align=False)
             if prepared is None:
                 continue
 
@@ -761,16 +1302,17 @@ class BlendingTrainerV8:
                 i_x_256,
                 target_mask,
                 satd_protect_mask,
-                _remove_mask,
+                remove_mask,
                 color_transfer_mask,
                 face_keep_mask,
+                skin_protect_mask,
                 hm_3e,
                 color_ref_mask,
             ) = prepared
             bsz = color_s.size(0)
 
             blend_s = self.model(align_s[:, 6:], color_s[:, 6:], face_i * target_mask, color_i * hm_3e)
-            latent_in = torch.cat((torch.zeros(bsz, 6, 512, device=self.device), blend_s), axis=1)
+            latent_in = self.build_generator_latent(align_s, blend_s)
             i_g, _ = self.helper.net.generator(
                 [latent_in],
                 input_is_latent=True,
@@ -784,9 +1326,14 @@ class BlendingTrainerV8:
                 i_g_256,
                 face_i,
                 color_i,
+                i_x_256,
                 target_mask,
-                hm_3e,
-                hm_3e,
+                color_transfer_mask,
+                color_ref_mask,
+                satd_protect_mask,
+                face_keep_mask,
+                skin_protect_mask,
+                remove_mask,
             )
 
             for key, value in loss_info.items():
@@ -822,7 +1369,15 @@ class BlendingTrainerV8:
             f"[blending_v8] epoch={epoch + 1} "
             f"val_loss={avg_losses['loss']:.6f} "
             f"val_face={avg_losses['face_loss']:.6f} "
-            f"val_hair={avg_losses['hair_loss']:.6f}"
+            f"val_hair={avg_losses['hair_loss']:.6f} "
+            f"val_chroma={avg_losses['hair_chroma_stats']:.6f} "
+            f"val_hist={avg_losses['hair_chroma_hist']:.6f} "
+            f"val_rgb={avg_losses['hair_rgb_stats']:.6f} "
+            f"val_lab={avg_losses['hair_lab_mean']:.6f} "
+            f"val_vertical={avg_losses['hair_vertical_lab_mean']:.6f} "
+            f"val_luma={avg_losses['hair_luma_style']:.6f} "
+            f"val_over={avg_losses['hair_luma_over']:.6f} "
+            f"val_skin={avg_losses['skin_chroma_keep']:.6f}"
         )
         return avg_losses["loss"]
 
@@ -900,10 +1455,26 @@ def main():
 
     trainer = BlendingTrainerV8(model, optimizer, train_loader, val_loader, helper)
     print(
-        f"[blending_v8] train_on_shape_satd_align=True color_ref_geometry=False use_satd_v8={USER_USE_SATD_V8} "
+        f"[blending_v8] train_on_shape_satd_align=True "
+        f"author_color_align_aux={USER_AUTHOR_COLOR_ALIGN_BATCH_PROB > 0} use_satd_v8={USER_USE_SATD_V8} "
         f"satd_checkpoint={USER_SATD_CHECKPOINT_V8} "
         f"batch_size={USER_BATCH_SIZE} grad_accum_steps={USER_GRAD_ACCUM_STEPS} "
         f"effective_batch_size={USER_BATCH_SIZE * USER_GRAD_ACCUM_STEPS} "
+        f"hair_chroma_stats_w={USER_HAIR_CHROMA_STATS_LOSS_WEIGHT} "
+        f"hair_chroma_hist_w={USER_HAIR_CHROMA_HIST_LOSS_WEIGHT} "
+        f"hair_rgb_stats_w={USER_HAIR_RGB_STATS_LOSS_WEIGHT} "
+        f"hair_lab_mean_w={USER_HAIR_LAB_MEAN_LOSS_WEIGHT} "
+        f"hair_vertical_lab_mean_w={USER_HAIR_VERTICAL_LAB_MEAN_LOSS_WEIGHT} "
+        f"hair_luma_over_w={USER_HAIR_LUMA_OVER_LOSS_WEIGHT} "
+        f"remove_keep_w={USER_REMOVE_KEEP_L1_LOSS_WEIGHT} "
+        f"protect_chroma_keep_w={USER_PROTECT_CHROMA_KEEP_LOSS_WEIGHT} "
+        f"skin_chroma_keep_w={USER_SKIN_CHROMA_KEEP_LOSS_WEIGHT} "
+        f"skin_rgb_keep_w={USER_SKIN_RGB_KEEP_LOSS_WEIGHT} "
+        f"remove_block_in_target_hair={USER_REMOVE_BLOCK_IN_TARGET_HAIR} "
+        f"face_neck_color_block={USER_FACE_NECK_COLOR_BLOCK} "
+        f"target_hair_neck_override={USER_TARGET_HAIR_NECK_OVERRIDE} "
+        f"author_color_align_batch_prob={USER_AUTHOR_COLOR_ALIGN_BATCH_PROB} "
+        f"author_zero_prefix_train={USER_AUTHOR_ZERO_PREFIX_TRAIN} "
         f"resume_checkpoint={USER_RESUME_CHECKPOINT or '<none>'}",
         file=sys.stderr,
     )

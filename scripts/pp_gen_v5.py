@@ -17,54 +17,34 @@ from tqdm.auto import tqdm
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from hair_swap_v5 import HairFastV5 as HairFast, get_parser
-from models.ear_modules_v5 import (
-    EarAnchoredQueryBuilder,
-    FaceParsingHelperV5,
-    HairMaskExtractorV5,
-    align_earring_reference_to_target,
-    build_earring_highlight_mask,
-    build_revealed_skin_mask,
-    build_weak_earring_masks,
-    dilate_mask,
-    enhance_query_with_earring_recall,
-    resize_mask,
-    select_reference_earring_mask,
-)
+from models.ear_modules_v5 import EarAnchoredQueryBuilder, FaceParsingHelperV5, HairMaskExtractorV5
 from utils.bicubic import BicubicDownSample
 from utils.image_utils import list_image_files
 from utils.train import seed_everything
 
 CLEANUP_MASK_KEYS = ("M_remove", "M_remove_halo", "M_remove_face", "M_remove_tail", "M_remove_neck")
-PP_EXTRA_MASK_KEYS = (
-    "cleanup_inner_edge",
-    "revealed_skin_mask",
-    "source_skin_valid_mask",
-    "earring_confident_mask",
-    "earring_highlight_mask",
-    "earring_candidate_mask",
-)
 
 # ========================= User Config: edit here only =========================
 USER_DATASET_PROFILE = "small_accessory_ffhq"  # "small_accessory_ffhq" or "full_ffhq"
 
-USER_FACE_GALLERY_DIR_SMALL = Path("/root/shared-nvme/HairFastGAN/images/ear/")  #"/hf_h/images/FFHQ_short_long/"   hf_h/images/mix_ear/   HairFastGAN/images/ear/
-USER_DONOR_GALLERY_DIR_SMALL = Path("/root/shared-nvme/hf_h/images/FFHQ_short_long/")  #"images/FFHQ_short_long"  HairFastGAN/images/FFHQ_short/   hf_h/images/FFHQ_short_long/
-USER_OUTPUT_DIR_SMALL = Path("images/pp_dataset_v5_dual_ear_short_long")  
+USER_FACE_GALLERY_DIR_SMALL = Path("images/ear")
+USER_DONOR_GALLERY_DIR_SMALL = Path("images/FFHQ_short")
+USER_OUTPUT_DIR_SMALL = Path("images/pp_dataset_v5_dual_small")
 USER_DATASET_SIZE_SMALL = 0  # 0 means use every source image.
 USER_CHUNK_SIZE_SMALL = 128
 USER_MASK_BATCH_SIZE_SMALL = 8
 
-USER_FACE_GALLERY_DIR_FULL = Path("/root/shared-nvme/HairFastGAN/images/FFHQ")
-USER_DONOR_GALLERY_DIR_FULL = Path("/root/shared-nvme/HairFastGAN/images/FFHQ")
-USER_OUTPUT_DIR_FULL = Path("images/pp_dataset_v5_dual_full3")
+USER_FACE_GALLERY_DIR_FULL = Path("images/FFHQ")
+USER_DONOR_GALLERY_DIR_FULL = Path("images/FFHQ")
+USER_OUTPUT_DIR_FULL = Path("images/pp_dataset_v5_dual_full")
 USER_DATASET_SIZE_FULL = 10_000
 USER_CHUNK_SIZE_FULL = 256
 USER_MASK_BATCH_SIZE_FULL = 16
 
 USER_RANDOM_SEED = 3407
-USER_BLENDING_CHECKPOINT = "/root/shared-nvme/HairFastGAN/checkpoints/blending_3000best.pth"
+USER_BLENDING_CHECKPOINT = "checkpoints/blending_3000best.pth"
 USER_USE_SATD_V8 = True
-USER_SATD_CHECKPOINT_V8 = "/root/shared-nvme/HairFastGAN/checkpoints/satd_3000_best.pth"
+USER_SATD_CHECKPOINT_V8 = "checkpoints/satd_3000_best.pth"
 USER_SATD_BLEND_V8 = 0.28
 USER_SATD_BOUNDARY_V8 = 8
 USER_EQ8_REFERENCE_BLEND_V8 = 0.0
@@ -74,26 +54,15 @@ USER_PREFETCH_FACTOR = 1
 USER_SMOOTH = 5
 
 USER_EAR_PARSE_SIZE = 512
-USER_EAR_LOW_ALPHA = 0.1
-USER_EAR_DILATE = 21
+USER_EAR_DILATE = 31
 USER_HAIR_CHANGE_DILATE = 25
-USER_EARRING_EXPAND = 15
+USER_EARRING_EXPAND = 25
 USER_EAR_DOWNWARD_SHIFT = 10
 USER_TARGET_HAIR_DILATE = 11
-USER_EARRING_OCCLUSION_DILATE = 3
 USER_SOURCE_HAIR_BLOCK_DILATE = 5
-USER_SOURCE_HAIR_BLOCK_STRENGTH = 0.6
+USER_SOURCE_HAIR_BLOCK_STRENGTH = 0.75
 USER_TARGET_VISIBILITY_EXPAND = 5
 USER_MAX_TARGET_HAIR_OVERLAP = 0.55
-USER_ENABLE_EARRING_QUERY_RECALL = True
-USER_EARRING_QUERY_RECALL_DILATE = 7
-USER_EARRING_QUERY_DOWNWARD_SHIFT = 18
-USER_EARRING_QUERY_LOWER_LOBE_WEIGHT = 0.20
-USER_EARRING_QUERY_CANDIDATE_BOOST = 0.90
-USER_EARRING_QUERY_BLOCK_PROTECT = 0.85
-USER_EARRING_ALIGN_MAX_SHIFT = 12
-USER_EARRING_FINE_MASK_FLOOR = 0.18
-USER_EARRING_FINE_MASK_DILATE = 5
 # ============================================================================
 
 
@@ -151,26 +120,15 @@ RESOLVED_USER_CONFIG = {
     "prefetch_factor": USER_PREFETCH_FACTOR,
     "smooth": USER_SMOOTH,
     "ear_parse_size": USER_EAR_PARSE_SIZE,
-    "ear_low_alpha": USER_EAR_LOW_ALPHA,
     "ear_dilate": USER_EAR_DILATE,
     "hair_change_dilate": USER_HAIR_CHANGE_DILATE,
     "earring_expand": USER_EARRING_EXPAND,
     "ear_downward_shift": USER_EAR_DOWNWARD_SHIFT,
     "target_hair_dilate": USER_TARGET_HAIR_DILATE,
-    "earring_occlusion_dilate": USER_EARRING_OCCLUSION_DILATE,
     "source_hair_block_dilate": USER_SOURCE_HAIR_BLOCK_DILATE,
     "source_hair_block_strength": USER_SOURCE_HAIR_BLOCK_STRENGTH,
     "target_visibility_expand": USER_TARGET_VISIBILITY_EXPAND,
     "max_target_hair_overlap": USER_MAX_TARGET_HAIR_OVERLAP,
-    "enable_earring_query_recall": USER_ENABLE_EARRING_QUERY_RECALL,
-    "earring_query_recall_dilate": USER_EARRING_QUERY_RECALL_DILATE,
-    "earring_query_downward_shift": USER_EARRING_QUERY_DOWNWARD_SHIFT,
-    "earring_query_lower_lobe_weight": USER_EARRING_QUERY_LOWER_LOBE_WEIGHT,
-    "earring_query_candidate_boost": USER_EARRING_QUERY_CANDIDATE_BOOST,
-    "earring_query_block_protect": USER_EARRING_QUERY_BLOCK_PROTECT,
-    "earring_align_max_shift": USER_EARRING_ALIGN_MAX_SHIFT,
-    "earring_fine_mask_floor": USER_EARRING_FINE_MASK_FLOOR,
-    "earring_fine_mask_dilate": USER_EARRING_FINE_MASK_DILATE,
 }
 
 
@@ -249,26 +207,15 @@ def build_parser(defaults):
     parser.add_argument("--prefetch_factor", type=int, default=defaults["prefetch_factor"])
     parser.add_argument("--smooth", type=int, default=defaults["smooth"])
     parser.add_argument("--ear_parse_size", type=int, default=defaults["ear_parse_size"])
-    parser.add_argument("--ear_low_alpha", type=float, default=defaults["ear_low_alpha"])
     parser.add_argument("--ear_dilate", type=int, default=defaults["ear_dilate"])
     parser.add_argument("--hair_change_dilate", type=int, default=defaults["hair_change_dilate"])
     parser.add_argument("--earring_expand", type=int, default=defaults["earring_expand"])
     parser.add_argument("--ear_downward_shift", type=int, default=defaults["ear_downward_shift"])
     parser.add_argument("--target_hair_dilate", type=int, default=defaults["target_hair_dilate"])
-    parser.add_argument("--earring_occlusion_dilate", type=int, default=defaults["earring_occlusion_dilate"])
     parser.add_argument("--source_hair_block_dilate", type=int, default=defaults["source_hair_block_dilate"])
     parser.add_argument("--source_hair_block_strength", type=float, default=defaults["source_hair_block_strength"])
     parser.add_argument("--target_visibility_expand", type=int, default=defaults["target_visibility_expand"])
     parser.add_argument("--max_target_hair_overlap", type=float, default=defaults["max_target_hair_overlap"])
-    parser.add_argument("--enable_earring_query_recall", type=str2bool, default=defaults["enable_earring_query_recall"])
-    parser.add_argument("--earring_query_recall_dilate", type=int, default=defaults["earring_query_recall_dilate"])
-    parser.add_argument("--earring_query_downward_shift", type=int, default=defaults["earring_query_downward_shift"])
-    parser.add_argument("--earring_query_lower_lobe_weight", type=float, default=defaults["earring_query_lower_lobe_weight"])
-    parser.add_argument("--earring_query_candidate_boost", type=float, default=defaults["earring_query_candidate_boost"])
-    parser.add_argument("--earring_query_block_protect", type=float, default=defaults["earring_query_block_protect"])
-    parser.add_argument("--earring_align_max_shift", type=int, default=defaults["earring_align_max_shift"])
-    parser.add_argument("--earring_fine_mask_floor", type=float, default=defaults["earring_fine_mask_floor"])
-    parser.add_argument("--earring_fine_mask_dilate", type=int, default=defaults["earring_fine_mask_dilate"])
     return parser
 
 
@@ -309,11 +256,10 @@ def count_dataset_parts(total_items, chunk_size, batch_size):
 
 
 class RenderedPairDataset(Dataset):
-    def __init__(self, experiments, dataset_path, face_gallery_root, donor_gallery_root):
+    def __init__(self, experiments, dataset_path, face_gallery_root):
         self.experiments = experiments
         self.dataset_path = Path(dataset_path)
         self.face_gallery_root = Path(face_gallery_root)
-        self.donor_gallery_root = Path(donor_gallery_root)
 
     def __len__(self):
         return len(self.experiments)
@@ -322,11 +268,8 @@ class RenderedPairDataset(Dataset):
         item = self.experiments[idx]
         source_path = self.face_gallery_root / item["source_name"]
         target_path = self.dataset_path / item["target_name"]
-        _, shape_name, color_name = item["triplet"]
         return {
             "source_path": str(source_path),
-            "shape_reference_path": str(self.donor_gallery_root / shape_name),
-            "color_reference_path": str(self.donor_gallery_root / color_name),
             "source_full": load_image(source_path),
             "target_full": load_image(target_path),
             "cleanup_masks": item.get("cleanup_masks", {}),
@@ -346,12 +289,10 @@ class DatasetItemBatchBuilder:
             "earring_expand": args.earring_expand,
             "downward_shift": args.ear_downward_shift,
             "target_hair_dilate": args.target_hair_dilate,
-            "earring_occlusion_dilate": args.earring_occlusion_dilate,
             "source_hair_block_dilate": args.source_hair_block_dilate,
             "source_hair_block_strength": args.source_hair_block_strength,
             "target_visibility_expand": args.target_visibility_expand,
             "max_target_hair_overlap": args.max_target_hair_overlap,
-            "earring_align_max_shift": args.earring_align_max_shift,
         }
         accepted = inspect.signature(EarAnchoredQueryBuilder.__init__).parameters
         query_builder_kwargs = {
@@ -362,13 +303,11 @@ class DatasetItemBatchBuilder:
     def _iter_single_process_batches(self, dataset):
         batch_size = self.args.mask_batch_size
         total_batches = ceil_div(len(dataset), batch_size)
-        for start in tqdm(range(0, len(dataset), batch_size), total=total_batches, desc="Build dataset masks"):
+        for start in tqdm(range(0, len(dataset), batch_size), total=total_batches, leave=False):
             end = min(len(dataset), start + batch_size)
             batch_items = [dataset[idx] for idx in range(start, end)]
             yield {
                 "source_path": [item["source_path"] for item in batch_items],
-                "shape_reference_path": [item["shape_reference_path"] for item in batch_items],
-                "color_reference_path": [item["color_reference_path"] for item in batch_items],
                 "source_full": torch.stack([item["source_full"] for item in batch_items], dim=0),
                 "target_full": torch.stack([item["target_full"] for item in batch_items], dim=0),
                 "cleanup_masks": {
@@ -387,8 +326,8 @@ class DatasetItemBatchBuilder:
             }
 
     @torch.no_grad()
-    def iter_batches(self, experiments, dataset_path, face_gallery_root, donor_gallery_root):
-        dataset = RenderedPairDataset(experiments, dataset_path, face_gallery_root, donor_gallery_root)
+    def iter_batches(self, experiments, dataset_path, face_gallery_root):
+        dataset = RenderedPairDataset(experiments, dataset_path, face_gallery_root)
         if self.args.io_num_workers <= 0:
             batch_iterator = self._iter_single_process_batches(dataset)
         else:
@@ -406,8 +345,6 @@ class DatasetItemBatchBuilder:
 
         for batch in batch_iterator:
             source_paths = batch["source_path"]
-            shape_reference_paths = batch["shape_reference_path"]
-            color_reference_paths = batch["color_reference_path"]
             source_full = batch["source_full"].to(self.device, non_blocking=False)
             target_full = batch["target_full"].to(self.device, non_blocking=False)
             batch_cleanup_masks = batch.get("cleanup_masks", {})
@@ -431,94 +368,11 @@ class DatasetItemBatchBuilder:
                     value = torch.zeros_like(query_info["query_mask"])
                 cleanup_masks[key] = value.to(self.device, non_blocking=False).float().clamp(0, 1)
 
-            visible_ear_roi = query_info.get("visible_ear_roi")
-            if visible_ear_roi is None:
-                visible_ear_roi = query_info["ear_roi"]
-            detection_ear_roi = query_info.get("ear_roi", visible_ear_roi)
-            source_earring_detection_mask = query_info.get("source_earring_detection_mask")
-
-            weak_earring = build_weak_earring_masks(
-                source_256,
-                detection_ear_roi,
-                query_info["query_mask"],
-                source_earring_detection_mask,
-                query_info.get("source_hair_mask"),
-                source_hair_block_mask,
-                source_parsing,
-            )
-            if self.args.enable_earring_query_recall:
-                recall_info = enhance_query_with_earring_recall(
-                    query_info["query_mask"],
-                    source_earring_detection_mask,
-                    source_hair_block_mask,
-                    weak_earring,
-                    visibility_mask=visible_ear_roi,
-                    recall_dilate=self.args.earring_query_recall_dilate,
-                    downward_shift=self.args.earring_query_downward_shift,
-                    lower_lobe_weight=self.args.earring_query_lower_lobe_weight,
-                    candidate_boost=self.args.earring_query_candidate_boost,
-                    block_protect=self.args.earring_query_block_protect,
-                )
-                query_info.update(recall_info)
-                source_hair_block_mask = recall_info["source_hair_block_mask"]
-            earring_search_mask = weak_earring["earring_search_mask"]
-            clean_source_earring_mask = weak_earring.get(
-                "source_earring_clean_mask",
-                torch.zeros_like(query_info["source_earring_mask"]),
-            )
-            candidate_source_earring_mask = weak_earring.get(
-                "earring_candidate_mask",
-                torch.zeros_like(query_info["source_earring_mask"]),
-            )
-            source_earring_mask = select_reference_earring_mask(
-                clean_source_earring_mask,
-                candidate_source_earring_mask,
-                query_info["left_ear_roi"],
-                query_info["right_ear_roi"],
-            )
-            align_info = align_earring_reference_to_target(
-                source_256,
-                source_earring_mask,
-                query_info["source_left_ear_mask"],
-                query_info["source_right_ear_mask"],
-                query_info["target_left_ear_mask"],
-                query_info["target_right_ear_mask"],
-                query_info["left_ear_roi"],
-                query_info["right_ear_roi"],
-                max_vertical_shift=self.args.earring_align_max_shift,
-                max_horizontal_shift=max(1, self.args.earring_align_max_shift // 2),
-                reference_base=target_256,
-            )
-            earring_confident_mask = align_info["earring_confident_mask"]
-            if visible_ear_roi is not None:
-                earring_valid_roi = resize_mask(visible_ear_roi, earring_confident_mask.shape[-2:])
-                earring_confident_mask = earring_confident_mask * earring_valid_roi
-                align_info["earring_confident_mask"] = earring_confident_mask
-                align_info["earring_reference"] = (
-                    target_256 * (1.0 - earring_confident_mask)
-                    + align_info["earring_reference"] * earring_confident_mask
-                ).clamp(0, 1)
-            earring_highlight_mask = build_earring_highlight_mask(
-                align_info["earring_reference"],
-                earring_confident_mask,
-                query_info["query_mask"],
-            )
-            revealed_info = build_revealed_skin_mask(
-                cleanup_masks,
-                target_parsing,
-                source_parsing,
-                target_hair_d,
-                source_hair_d,
-                earring_confident_mask,
-            )
-
             batch_size = source_256.size(0)
             dataset_items = []
             for idx in range(batch_size):
                 item = {
                     "source_path": source_paths[idx],
-                    "shape_reference_path": shape_reference_paths[idx],
-                    "color_reference_path": color_reference_paths[idx],
                     "target": target_256[idx].cpu(),
                     "target_mask": target_mask[idx].cpu(),
                     "HT_E": target_hair_e[idx].cpu(),
@@ -527,10 +381,9 @@ class DatasetItemBatchBuilder:
                     "source_hair_mask": query_info["source_hair_mask"][idx].cpu(),
                     "target_hair_mask": query_info["target_hair_mask"][idx].cpu(),
                     "source_hair_block_mask": source_hair_block_mask[idx].cpu(),
-                    "source_earring_mask": source_earring_mask[idx].cpu(),
+                    "source_earring_mask": query_info["source_earring_mask"][idx].cpu(),
                     "target_earring_mask": query_info["target_earring_mask"][idx].cpu(),
                     "query_mask": query_info["query_mask"][idx].cpu(),
-                    "earring_search_mask": earring_search_mask[idx].cpu(),
                     "ear_roi": query_info["ear_roi"][idx].cpu(),
                     "left_ear_roi": query_info["left_ear_roi"][idx].cpu(),
                     "right_ear_roi": query_info["right_ear_roi"][idx].cpu(),
@@ -538,15 +391,6 @@ class DatasetItemBatchBuilder:
                 }
                 for key in CLEANUP_MASK_KEYS:
                     item[key] = cleanup_masks[key][idx].cpu()
-                for key in PP_EXTRA_MASK_KEYS:
-                    if key == "earring_confident_mask":
-                        item[key] = earring_confident_mask[idx].cpu()
-                    elif key == "earring_highlight_mask":
-                        item[key] = earring_highlight_mask[idx].cpu()
-                    elif key == "earring_candidate_mask":
-                        item[key] = weak_earring["earring_candidate_mask"][idx].cpu()
-                    else:
-                        item[key] = revealed_info[key][idx].cpu()
                 dataset_items.append(item)
 
             yield dataset_items
@@ -556,7 +400,6 @@ class DatasetItemBatchBuilder:
             del source_full, target_full, source_256, target_256
             del source_hair_d, target_hair_d, target_hair_e, target_mask
             del source_parsing, target_parsing, query_info, cleanup_masks
-            del weak_earring, earring_search_mask, source_earring_mask, align_info, earring_confident_mask, earring_highlight_mask, revealed_info
             if self.device == "cuda":
                 torch.cuda.empty_cache()
 
@@ -587,29 +430,6 @@ def main(args):
     model_args.satd_blend_v8 = args.satd_blend_v8
     model_args.satd_boundary_v8 = args.satd_boundary_v8
     model_args.eq8_reference_blend_v8 = args.eq8_reference_blend_v8
-    model_args.ear_low_alpha = args.ear_low_alpha
-    model_args.ear_dilate = args.ear_dilate
-    model_args.hair_change_dilate = args.hair_change_dilate
-    model_args.earring_expand = args.earring_expand
-    model_args.ear_downward_shift = args.ear_downward_shift
-    model_args.target_hair_dilate = args.target_hair_dilate
-    model_args.earring_occlusion_dilate = args.earring_occlusion_dilate
-    model_args.source_hair_block_dilate = args.source_hair_block_dilate
-    model_args.source_hair_block_strength = args.source_hair_block_strength
-    model_args.target_visibility_expand = args.target_visibility_expand
-    model_args.max_target_hair_overlap = args.max_target_hair_overlap
-    model_args.earring_align_max_shift = args.earring_align_max_shift
-    model_args.earring_query_dilate = 3
-    model_args.earring_query_boost = 1.0
-    model_args.enable_earring_query_recall = args.enable_earring_query_recall
-    model_args.earring_query_recall_dilate = args.earring_query_recall_dilate
-    model_args.earring_query_downward_shift = args.earring_query_downward_shift
-    model_args.earring_query_lower_lobe_weight = args.earring_query_lower_lobe_weight
-    model_args.earring_query_candidate_boost = args.earring_query_candidate_boost
-    model_args.earring_query_block_protect = args.earring_query_block_protect
-    model_args.ear_fine_support_dilate = 3
-    model_args.earring_fine_mask_floor = args.earring_fine_mask_floor
-    model_args.earring_fine_mask_dilate = args.earring_fine_mask_dilate
     hair_fast = HairFast(model_args)
     hairfast_wo_pp(hair_fast)
     item_batch_builder = DatasetItemBatchBuilder(args)
@@ -673,14 +493,8 @@ def main(args):
                 item["cleanup_masks"] = cleanup_masks
                 save_image(image, os.path.join(temp_dir, item["target_name"]))
 
-            for dataset_items in item_batch_builder.iter_batches(
-                batch_experiments,
-                temp_dir,
-                args.face_gallery_dir,
-                args.donor_gallery_dir,
-            ):
+            for dataset_items in item_batch_builder.iter_batches(batch_experiments, temp_dir, args.face_gallery_dir):
                 torch.save(dataset_items, args.output / f"pp_part_{part_idx}.dataset")
-                print(f"Saved {args.output / f'pp_part_{part_idx}.dataset'}")
                 part_idx += 1
 
         left = right

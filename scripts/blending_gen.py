@@ -1,5 +1,6 @@
 import argparse
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "1,3"
 import sys
 from pathlib import Path
 
@@ -62,11 +63,23 @@ def main(args):
 
             pt1, pt2, pt3 = map(lambda im: args.FFHQ / im, imgs)
             align_shape, align_color, name_to_embed = hair_fast(pt1, pt2, pt3, align_flag=True)
+            
+            # 保存第一阶段的单图基础特征
             save_latents(args.output, 'FS', f'{im1}.npz', latent_in=name_to_embed['face']['S'])
             save_latents(args.output, 'FS', f'{im2}.npz', latent_in=name_to_embed['shape']['S'])
             save_latents(args.output, 'FS', f'{im3}.npz', latent_in=name_to_embed['color']['S'])
-            save_latents(args.output, 'Align', f'{im1}_{im2}.npz', latent_F=align_shape['latent_F_align'])
-            save_latents(args.output, 'Align', f'{im1}_{im3}.npz', latent_F=align_color['latent_F_align'])
+            
+            # 【核心修复】：通知安检员放行 F_sean1 和 F_sean2！
+            # 使用 .get() 是为了防止极小概率(抽到同一个人脸)时导致的键值丢失崩溃
+            save_latents(args.output, 'Align', f'{im1}_{im2}.npz', 
+                         latent_F=align_shape['latent_F_align'],
+                         F_sean1=align_shape.get('F_sean1', align_shape['latent_F_align']),
+                         F_sean2=align_shape.get('F_sean2', align_shape['latent_F_align']))
+                         
+            save_latents(args.output, 'Align', f'{im1}_{im3}.npz', 
+                         latent_F=align_color['latent_F_align'],
+                         F_sean1=align_color.get('F_sean1', align_color['latent_F_align']),
+                         F_sean2=align_color.get('F_sean2', align_color['latent_F_align']))
 
 
 if __name__ == '__main__':

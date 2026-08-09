@@ -3,7 +3,8 @@ import os.path as osp
 import time
 import torch
 import numpy as np
-from tqdm import tqdm
+from tqdm.auto import tqdm
+from argparse import Namespace
 
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, DistributedSampler
@@ -19,6 +20,11 @@ from models.STAR.lib.loss import *
 from models.STAR.lib.metric import NME, FR_AUC
 from models.STAR.lib.utils import convert_secs2time
 from models.STAR.lib.utils import AverageMeter
+
+landmarks_arg = Namespace(
+    config_name='alignment',
+    pretrained_weight='pretrained_models/STAR/WFLW_STARLoss_NME_4_02_FR_2_32_AUC_0_605.pkl'
+)
 
 
 def get_config(args):

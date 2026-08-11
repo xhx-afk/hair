@@ -35,7 +35,7 @@ from utils.train import WandbLogger, toggle_grad
 USER_CUDA_VISIBLE_DEVICES = "0"
 USER_DEVICE = "cuda"
 
-USER_DATASET_PROFILE = "small"
+USER_DATASET_PROFILE = "ffhq"
 
 USER_DATASET_DIR_FFHQ = Path("images/satd_dataset_v8_3000")
 USER_FFHQ_ROOT = Path("images/FFHQ")
@@ -90,21 +90,18 @@ USER_LAMBDA_REVEAL_IMPROVE_V8 = 0.85
 USER_LAMBDA_CHANGE_FROM_AUTHOR_V8 = 0.95
 USER_LAMBDA_SHADOW_V8 = 1.20
 USER_LAMBDA_HALO_V8 = 1.45
-USER_LAMBDA_TAIL_V8 = 1.25
-USER_LAMBDA_FACE_V8 = 0.55
-USER_LAMBDA_FACE_RESIDUE_V8 = 1.35
-USER_LAMBDA_FACE_RESIDUE_RGB_V8 = 0.85
-USER_LAMBDA_NECK_V8 = 1.35
-USER_LAMBDA_NECK_RESIDUE_V8 = 1.35
+USER_LAMBDA_TAIL_V8 = 0.95
+USER_LAMBDA_FACE_V8 = 0.70
+USER_LAMBDA_FACE_RESIDUE_V8 = 1.05
+USER_LAMBDA_NECK_V8 = 1.20
+USER_LAMBDA_NECK_RESIDUE_V8 = 1.10
 USER_LAMBDA_IMPROVE_V8 = 0.55
-USER_LAMBDA_FACE_SHADOW_V8 = 0.85
-USER_LAMBDA_BG_SHADOW_V8 = 0.95
+USER_LAMBDA_FACE_SHADOW_V8 = 1.55
+USER_LAMBDA_BG_SHADOW_V8 = 1.10
 USER_LAMBDA_NON_DARK_V8 = 1.25
 USER_LAMBDA_BG_NON_DARK_V8 = 1.10
 USER_LAMBDA_OVERLAP_NON_DARK_V8 = 1.05
-USER_LAMBDA_FACE_DETAIL_KEEP_V8 = 2.10
-USER_LAMBDA_FACE_SKIN_KEEP_V8 = 1.45
-USER_LAMBDA_FACE_DETAIL_EDGE_KEEP_V8 = 0.70
+USER_LAMBDA_FACE_DETAIL_KEEP_V8 = 1.55
 USER_LAMBDA_BODY_DETAIL_KEEP_V8 = 1.75
 USER_LAMBDA_VISIBLE_BODY_DETAIL_KEEP_V8 = 1.35
 USER_LAMBDA_FACE_IMPROVE_V8 = 0.95
@@ -561,7 +558,6 @@ class TrainerSATD_v8:
             ear_surface = delta_masks.get("M_ear_surface", torch.zeros_like(remove))
             detail_protect = delta_masks.get("M_detail_protect", torch.zeros_like(remove))
             face_cleanup_surface = delta_masks.get("M_face_cleanup_surface", torch.zeros_like(remove))
-            face_strand_probe = delta_masks.get("M_face_strand_probe", torch.zeros_like(remove))
             body_preserve = delta_masks.get("M_body_preserve", torch.zeros_like(remove))
             cloth_region = delta_masks.get("M_cloth_region", torch.zeros_like(remove))
             body_region = delta_masks.get("M_body_region", torch.zeros_like(remove))
@@ -578,7 +574,7 @@ class TrainerSATD_v8:
             detail_energy = torch.maximum(author_detail, source_detail)
             face_detail_keep = (
                 detail_protect
-                + 0.42 * detail_energy * (face_cleanup_surface + 0.35 * ear_surface).clamp(0, 1)
+                + 0.30 * detail_energy * (face_cleanup_surface + 0.35 * ear_surface).clamp(0, 1)
             ).clamp(0, 1)
             body_detail_keep = (
                 body_preserve
@@ -603,19 +599,18 @@ class TrainerSATD_v8:
                 0.60 * erode_mask(face_cleanup_surface, 1)
                 + 0.40 * face_cleanup_surface
             ).clamp(0, 1)
-            face_residue_seed = (remove_face + 0.46 * remove_halo + 0.58 * face_strand_probe).clamp(0, 1)
+            face_residue_seed = (remove_face + 0.68 * remove_halo).clamp(0, 1)
             face_residue_focus = (
                 dilate_mask(face_residue_seed, 1)
                 * face_cleanup_core
-                * (1.0 - 0.28 * detail_protect)
             ).clamp(0, 1)
             face_shadow_focus = (
                 0.55 * erode_mask(face_residue_focus, 1)
                 + 0.45 * face_residue_focus
             ).clamp(0, 1)
             neck_residue_focus = (
-                dilate_mask((remove_neck + 0.92 * remove_tail + 0.24 * remove_halo).clamp(0, 1), 1)
-                * (1.0 - 0.72 * body_detail_keep)
+                dilate_mask((remove_neck + 0.78 * remove_tail + 0.20 * remove_halo).clamp(0, 1), 1)
+                * (1.0 - 0.76 * body_detail_keep)
                 * (1.0 - 0.45 * cloth_region)
             ).clamp(0, 1)
 
@@ -634,19 +629,19 @@ class TrainerSATD_v8:
             ).clamp(0, 1)
             halo_region = (remove_halo + 0.18 * remove + 0.16 * remove_face + 0.18 * remove_neck).clamp(0, 1)
             halo_region = (halo_region * (1.0 - 0.82 * face_detail_keep) * (1.0 - 0.85 * body_detail_keep)).clamp(0, 1)
-            tail_region = ((1.08 * remove_tail + 0.44 * remove_neck + 0.18 * remove_halo) * (1.0 - 0.76 * body_detail_keep)).clamp(0, 1)
+            tail_region = ((remove_tail + 0.36 * remove_neck + 0.16 * remove_halo) * (1.0 - 0.80 * body_detail_keep)).clamp(0, 1)
             face_region = (
                 face_residue_focus
-                * (1.0 - 0.72 * face_detail_keep)
+                * (1.0 - 0.82 * face_detail_keep)
             ).clamp(0, 1)
             neck_region = (
                 (remove_neck + 0.48 * remove_tail + 0.18 * remove_halo)
                 * (1.0 - 0.82 * body_detail_keep)
             ).clamp(0, 1)
             face_shadow_region = (
-                (0.52 * remove_face + 0.18 * remove_halo + 0.03 * boundary)
+                (0.82 * remove_face + 0.28 * remove_halo + 0.04 * boundary)
                 * face_shadow_focus
-                * (1.0 - 0.97 * face_detail_keep)
+                * (1.0 - 0.94 * face_detail_keep)
                 * (1.0 - 0.15 * body_preserve)
             ).clamp(0, 1)
             background_shadow_region = (
@@ -658,9 +653,8 @@ class TrainerSATD_v8:
             non_dark_region = (face_shadow_region + 0.12 * halo_region).clamp(0, 1)
             bg_non_dark_region = (background_shadow_region + 0.15 * halo_region * context_region).clamp(0, 1)
             neck_improve_region = (neck_region + 0.95 * tail_region + 0.35 * neck_residue_focus).clamp(0, 1)
-            face_target = 0.28 * info["source_inpaint_256"] + 0.72 * author
-            face_residue_rgb_target = 0.88 * info["source_inpaint_256"] + 0.12 * author
-            face_residue_target = gray(face_residue_rgb_target)
+            face_target = 0.42 * info["source_inpaint_256"] + 0.58 * author
+            face_residue_target = gray(0.80 * info["source_inpaint_256"] + 0.20 * author)
             tail_target = 0.96 * info["source_inpaint_256"] + 0.04 * author
             neck_target = 0.94 * info["source_inpaint_256"] + 0.06 * author
             neck_residue_target = gray(0.90 * info["source_inpaint_256"] + 0.10 * author)
@@ -697,23 +691,13 @@ class TrainerSATD_v8:
             face_shadow_target = shadow_target_low
             background_shadow_target = shadow_target_low
             non_dark_baseline = gray(author)
-            face_skin_keep_region = (
-                (face_surface + 0.35 * ear_surface).clamp(0, 1)
-                * (1.0 - 0.88 * face_region)
-                * (1.0 - 0.70 * face_shadow_region)
-            ).clamp(0, 1)
-            face_detail_edge_keep_region = (
-                face_detail_keep
-                * (1.0 - 0.72 * face_region)
-                * (1.0 - 0.55 * face_shadow_region)
-            ).clamp(0, 1)
 
             cleanup_focus = (
                 shadow_region
-                + 0.96 * tail_region
-                + 0.68 * face_region
-                + 0.82 * neck_region
-                + 0.38 * neck_residue_focus
+                + 0.85 * tail_region
+                + 0.60 * face_region
+                + 0.74 * neck_region
+                + 0.30 * neck_residue_focus
                 + 0.68 * body_reveal_only
                 + 0.60 * reveal_overlap
                 + 0.52 * context_reveal_only
@@ -740,7 +724,6 @@ class TrainerSATD_v8:
             losses["tail"] += masked_l1(pred, tail_target, tail_region)
             losses["face"] += masked_l1(pred, face_target, face_region)
             losses["face_residue"] += masked_l1(gray(pred), face_residue_target, face_region)
-            losses["face_residue_rgb"] += masked_l1(pred, face_residue_rgb_target, face_region)
             losses["neck"] += masked_l1(pred, neck_target, neck_region)
             losses["neck_residue"] += masked_l1(gray(pred), neck_residue_target, neck_residue_focus)
             losses["face_shadow"] += masked_l1(gray_low(pred), face_shadow_target, face_shadow_region)
@@ -757,12 +740,6 @@ class TrainerSATD_v8:
                 neck_improve_region,
             )
             losses["face_detail_keep"] += masked_l1(pred, author, face_detail_keep)
-            losses["face_skin_keep"] += masked_l1(pred, author, face_skin_keep_region)
-            losses["face_detail_edge_keep"] += masked_l1(
-                sobel_edges(pred),
-                sobel_edges(author),
-                face_detail_edge_keep_region,
-            )
             losses["body_detail_keep"] += masked_l1(pred, author, stable_body_detail_keep)
             losses["visible_body_detail_keep"] += masked_l1(pred, visible_body_anchor_target, visible_body_detail_keep)
             losses["latent_keep"] += masked_l1(latent_F, info["latent_F_author"], keep32)
@@ -785,7 +762,6 @@ class TrainerSATD_v8:
             + USER_LAMBDA_TAIL_V8 * schedule["tail_scale"] * losses["tail"]
             + USER_LAMBDA_FACE_V8 * schedule["face_scale"] * losses["face"]
             + USER_LAMBDA_FACE_RESIDUE_V8 * schedule["face_scale"] * losses["face_residue"]
-            + USER_LAMBDA_FACE_RESIDUE_RGB_V8 * schedule["face_scale"] * losses["face_residue_rgb"]
             + USER_LAMBDA_NECK_V8 * schedule["neck_scale"] * losses["neck"]
             + USER_LAMBDA_NECK_RESIDUE_V8 * schedule["neck_scale"] * losses["neck_residue"]
             + USER_LAMBDA_FACE_SHADOW_V8 * schedule["face_shadow_scale"] * losses["face_shadow"]
@@ -794,8 +770,6 @@ class TrainerSATD_v8:
             + USER_LAMBDA_BG_NON_DARK_V8 * schedule["non_dark_scale"] * losses["bg_non_dark"]
             + USER_LAMBDA_OVERLAP_NON_DARK_V8 * schedule["non_dark_scale"] * losses["overlap_non_dark"]
             + USER_LAMBDA_FACE_DETAIL_KEEP_V8 * losses["face_detail_keep"]
-            + USER_LAMBDA_FACE_SKIN_KEEP_V8 * losses["face_skin_keep"]
-            + USER_LAMBDA_FACE_DETAIL_EDGE_KEEP_V8 * losses["face_detail_edge_keep"]
             + USER_LAMBDA_BODY_DETAIL_KEEP_V8 * losses["body_detail_keep"]
             + USER_LAMBDA_VISIBLE_BODY_DETAIL_KEEP_V8 * losses["visible_body_detail_keep"]
             + USER_LAMBDA_FACE_IMPROVE_V8 * schedule["improve_scale"] * losses["face_improve"]

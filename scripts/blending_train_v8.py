@@ -1,5 +1,6 @@
 ﻿import atexit
 import gc
+import json
 import multiprocessing
 import os
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
@@ -22,9 +23,14 @@ from tqdm.auto import tqdm
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from hair_swap_v8 import HairFast_v8, get_parser_v8
-from models.Encoders import ClipBlendingModel as BlendingModel
+from models.Encoders import (
+    DIRECT_COLOR_ARCH_V8_2,
+    DirectColorBlendAdapterV8 as BlendingModel,
+    load_direct_color_adapter_state_v8,
+)
 from models.Net import Net
-from models.SG_IDCT_v16 import gaussian_blur2d
+from models.SG_IDCT_v16 import gaussian_blur2d, rgb_to_lab
+from models.color_condition_v8 import ColorConditionConfigV8, build_color_condition_bundle
 from models.face_parsing.model import BiSeNet, seg_mean, seg_std
 from utils.bicubic import BicubicDownSample
 from utils.image_utils import DilateErosion
@@ -51,40 +57,72 @@ def clean_zombies():
 
 
 # ========================= User Config: edit here only =========================
-USER_DATASET_PROFILE = "small"
+USER_DATASET_PROFILE = os.environ.get("BLENDING_V8_DATASET_PROFILE", "small").strip().lower()
 
 USER_DATASET_DIR_FFHQ = Path("input/blending_dataset_v8")
-USER_FACE_ROOT_FFHQ = Path("images/FFHQ")
-USER_SHAPE_ROOT_FFHQ = Path("images/FFHQ")
-USER_COLOR_ROOT_FFHQ = Path("images/FFHQ")
-USER_OUTPUT_DIR_FFHQ = Path("output/blending_train_v8")
+USER_FACE_ROOT_FFHQ = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FFHQ")
+USER_SHAPE_ROOT_FFHQ = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FFHQ")
+USER_COLOR_ROOT_FFHQ = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FFHQ")
+USER_OUTPUT_DIR_FFHQ = Path("output/blending_train_v8_direct_anchor_v2")
 USER_VAL_SIZE_FFHQ = 512
 
-USER_DATASET_DIR_SMALL = Path("input/blending_dataset_v8_small")
-USER_FACE_ROOT_SMALL = Path("images/FFHQ_long")
-USER_SHAPE_ROOT_SMALL = Path("images/FFHQ_short")
-USER_COLOR_ROOT_SMALL = Path("images/FFHQ_color")
-USER_OUTPUT_DIR_SMALL = Path("output/blending_train_v8_small")
+USER_DATASET_DIR_SMALL = Path("input/blending_dataset_v8_small_v2_short_to_long")
+USER_FACE_ROOT_SMALL = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FFHQ_short")
+USER_SHAPE_ROOT_SMALL = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/long")
+USER_COLOR_ROOT_SMALL = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FFHQ_color")
+USER_OUTPUT_DIR_SMALL = Path("output/blending_train_v8_direct_anchor_v2_small")
 USER_VAL_SIZE_SMALL = 64
 
 USER_DEVICE = "cuda"
 USER_RANDOM_SEED = 3407
-USER_BATCH_SIZE = 8
-USER_GRAD_ACCUM_STEPS = 2  # effective batch size = USER_BATCH_SIZE * USER_GRAD_ACCUM_STEPS
+USER_BATCH_SIZE = 16
+USER_GRAD_ACCUM_STEPS = 1  # effective batch size = USER_BATCH_SIZE * USER_GRAD_ACCUM_STEPS
 USER_NUM_WORKERS = 0
 USER_PIN_MEMORY = False
-USER_EPOCHS = 20
-USER_LR = 2e-5
+USER_EPOCHS = 40
+USER_STAGE_A_EPOCHS = 15
+USER_LR_STAGE_A = 1e-4
+USER_LR_STAGE_B = 5e-5
 USER_WEIGHT_DECAY = 1e-6
 USER_GRAD_CLIP = 5.0
 USER_FACE_CLIP_LOSS_WEIGHT = 1.0
-USER_HAIR_CLIP_LOSS_WEIGHT = 0.25
+USER_PSEUDO_AB_LOSS_WEIGHT = 12.0
+USER_PSEUDO_RGB_LOSS_WEIGHT = 1.0
+USER_PSEUDO_LUMA_LOSS_WEIGHT = 3.0
+USER_POSITIVE_LUMA_EXCESS_WEIGHT = 4.0
+USER_HF_LUMA_EXCESS_WEIGHT = 1.0
+USER_CORRECTION_NORM_WEIGHT = 0.10
+USER_LUMA_EXCESS_MARGIN = 4.0
+USER_HF_LUMA_EXCESS_MARGIN = 1.5
+USER_FACE_KEEP_L1_LOSS_WEIGHT = 1.0
+USER_REMOVE_KEEP_L1_LOSS_WEIGHT = 1.1
+USER_PROTECT_CHROMA_KEEP_LOSS_WEIGHT = 2.5
+USER_SKIN_CHROMA_KEEP_LOSS_WEIGHT = 8.0
+USER_SKIN_RGB_KEEP_LOSS_WEIGHT = 4.0
+USER_SAFE_HAIR_MIN_PIXELS = 64.0
+USER_REMOVE_BLOCK_IN_TARGET_HAIR = 0.12
+USER_FACE_NECK_COLOR_BLOCK = 0.96
+USER_TARGET_HAIR_NECK_OVERRIDE = 0.94
+USER_AUTHOR_COLOR_ALIGN_BATCH_PROB = 0.0
+USER_AUTHOR_ZERO_PREFIX_TRAIN = True
 
-USER_INIT_BLENDING_CKPT = "pretrained_models/Blending/checkpoint.pth"
-USER_FALLBACK_BLENDING_CKPT = "pretrained_models/Blending/checkpoint.pth"
+USER_CHROMA_NO_EDIT_THRESHOLD_V8 = 3.0
+USER_CHROMA_FULL_EDIT_THRESHOLD_V8 = 19.0
+USER_LIGHTNESS_NO_EDIT_THRESHOLD_V8 = 3.0
+USER_LIGHTNESS_FULL_EDIT_THRESHOLD_V8 = 15.0
+USER_MAX_GLOBAL_L_SHIFT_V8 = 20.0
+USER_MIN_SAFE_REFERENCE_FRACTION_V8 = 0.35
+USER_HIGHLIGHT_MAD_SCALE = 1.8
+USER_HIGHLIGHT_GLOBAL_MIN_MARGIN = 3.0
+USER_HIGHLIGHT_LOCAL_L_MARGIN = 2.5
+USER_HIGHLIGHT_LOCAL_C_MARGIN = 1.5
+USER_HIGHLIGHT_CHROMA_RATIO = 0.82
+USER_DIRECT_MIX_INIT = 0.65
+USER_DIRECT_MIX_FLOOR = 0.20
+USER_CORRECTION_BUDGET_RATIO = 0.25
 USER_CLIP_MODEL = "ViT-B/32"
 USER_USE_SATD_V8 = True
-USER_SATD_CHECKPOINT_V8 = "checkpoints/satd_small_best.pth"
+USER_SATD_CHECKPOINT_V8 = "/data/coding/HairFastGAN/HairFastGAN-main/best.pth"
 USER_SATD_BLEND_V8 = 0.34
 USER_SATD_BOUNDARY_V8 = 8
 USER_EQ8_REFERENCE_BLEND_V8 = 0.0
@@ -101,8 +139,9 @@ USER_LOG_IMAGE_COUNT = 30
 # Set this to output/.../checkpoints/last.pth or best.pth to continue training.
 USER_RESUME_CHECKPOINT = ""
 
-# Three-input objective: geometry comes from shape/SATD, while the color
-# reference only supplies Color_S and hair appearance.
+# Shape/SATD remains the validation and inference geometry. During training,
+# a minority of batches use the author's face->color alignment so the encoder
+# also learns reference color across the complete reference-hair extent.
 # ============================================================================
 
 
@@ -145,6 +184,12 @@ if USER_BATCH_SIZE < 1:
     raise RuntimeError("USER_BATCH_SIZE must be >= 1.")
 if USER_GRAD_ACCUM_STEPS < 1:
     raise RuntimeError("USER_GRAD_ACCUM_STEPS must be >= 1.")
+if USER_AUTHOR_COLOR_ALIGN_BATCH_PROB != 0.0:
+    raise RuntimeError("BlendingV8 color-direction fix requires USER_AUTHOR_COLOR_ALIGN_BATCH_PROB=0.0.")
+if not 0.0 <= USER_TARGET_HAIR_NECK_OVERRIDE <= 1.0:
+    raise RuntimeError("USER_TARGET_HAIR_NECK_OVERRIDE must be in [0, 1].")
+if not 0 <= USER_STAGE_A_EPOCHS <= USER_EPOCHS:
+    raise RuntimeError("USER_STAGE_A_EPOCHS must be in [0, USER_EPOCHS].")
 
 
 def set_seed(seed: int):
@@ -153,30 +198,6 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-
-def load_compatible_state_dict(module: torch.nn.Module, state_dict: dict[str, torch.Tensor]) -> list[str]:
-    model_state = module.state_dict()
-    compatible = {
-        key: value
-        for key, value in state_dict.items()
-        if key in model_state and model_state[key].shape == value.shape
-    }
-    model_state.update(compatible)
-    module.load_state_dict(model_state, strict=False)
-    return sorted(compatible.keys())
-
-
-def resolve_init_blending_checkpoint() -> Path:
-    ckpt_path = Path(USER_INIT_BLENDING_CKPT) if USER_INIT_BLENDING_CKPT else Path(USER_FALLBACK_BLENDING_CKPT)
-    if not ckpt_path.exists():
-        raise FileNotFoundError(
-            f"Cannot find blending init checkpoint: {ckpt_path}. "
-            "Do not train v8 blending from scratch; use the author's pretrained blending checkpoint."
-        )
-    if not USER_INIT_BLENDING_CKPT:
-        print(f"[blending_v8] USER_INIT_BLENDING_CKPT is empty; using fallback {ckpt_path}", file=sys.stderr)
-    return ckpt_path
 
 
 def find_image_path(root: Path, stem: str) -> Path:
@@ -234,6 +255,10 @@ def build_remove_protect_mask(align_info: dict[str, object]) -> torch.Tensor:
         + 0.92 * delta_masks.get("M_remove_tail", zero).float()
         + 0.70 * delta_masks.get("M_face_strand_probe", zero).float()
         + 0.80 * delta_masks.get("M_remove_context", zero).float()
+        + 0.86 * delta_masks.get("M_body_preserve", zero).float()
+        + 0.72 * delta_masks.get("M_visible_body_anchor", zero).float()
+        + 0.60 * delta_masks.get("M_body_region", zero).float()
+        + 0.68 * delta_masks.get("M_cloth_region", zero).float()
         + 0.35 * delta_masks.get("M_boundary", zero).float()
     )
     return protect.clamp(0, 1)
@@ -300,19 +325,32 @@ def ensure_dataset_cache_v8(triplets: list[tuple[str, str, str]]):
     def mask_path(face_stem: str, ref_role: str, ref_stem: str) -> Path:
         return mask_dir / align_cache_name(face_stem, ref_role, ref_stem)
 
+    def mask_has_target_hair(path: Path) -> bool:
+        if not path.exists():
+            return False
+        try:
+            with np.load(path) as data:
+                return "target_hair" in data.files
+        except Exception:
+            return False
+
     def missing_required_cache() -> list[Path]:
         missing = []
         for face_name, shape_name, color_name in triplets:
+            shape_mask_path = mask_path(face_name, "shape", shape_name)
+            color_mask_path = mask_path(face_name, "color", color_name)
             required = [
                 fs_path("face", face_name),
                 fs_path("shape", shape_name),
                 fs_path("color", color_name),
                 align_path(face_name, "shape", shape_name),
                 align_path(face_name, "color", color_name),
-                mask_path(face_name, "shape", shape_name),
-                mask_path(face_name, "color", color_name),
             ]
             missing.extend(path for path in required if not path.exists())
+            if not mask_has_target_hair(shape_mask_path):
+                missing.append(shape_mask_path)
+            if not mask_has_target_hair(color_mask_path):
+                missing.append(color_mask_path)
         return missing
 
     if not USER_BUILD_CACHE_WITH_CURRENT_SATD:
@@ -320,8 +358,9 @@ def ensure_dataset_cache_v8(triplets: list[tuple[str, str, str]]):
         if missing:
             preview = "\n".join(f"  {path}" for path in missing[:10])
             raise RuntimeError(
-                "Role-scoped v8 blending cache is missing. The old unscoped cache can mix "
-                "FFHQ_long/FFHQ_short/FFHQ_color entries with the same stem, so it is unsafe. "
+                "Role-scoped v8 blending cache is missing or stale. The Masks cache must include "
+                "target_hair for long-hair color supervision, and the old unscoped cache can mix "
+                "FFHQ_long/FFHQ_short/FFHQ_color entries with the same stem. "
                 "Run scripts/blending_gen_v8.py again or set USER_BUILD_CACHE_WITH_CURRENT_SATD=True "
                 f"to rebuild it.\nMissing examples:\n{preview}"
             )
@@ -332,8 +371,8 @@ def ensure_dataset_cache_v8(triplets: list[tuple[str, str, str]]):
     for face_name, shape_name, color_name in triplets:
         need_align_shape = USER_FORCE_REFRESH_ALIGN_CACHE or (not align_path(face_name, "shape", shape_name).exists())
         need_align_color = USER_FORCE_REFRESH_ALIGN_CACHE or (not align_path(face_name, "color", color_name).exists())
-        need_mask_shape = USER_FORCE_REFRESH_ALIGN_CACHE or (not mask_path(face_name, "shape", shape_name).exists())
-        need_mask_color = USER_FORCE_REFRESH_ALIGN_CACHE or (not mask_path(face_name, "color", color_name).exists())
+        need_mask_shape = USER_FORCE_REFRESH_ALIGN_CACHE or (not mask_has_target_hair(mask_path(face_name, "shape", shape_name)))
+        need_mask_color = USER_FORCE_REFRESH_ALIGN_CACHE or (not mask_has_target_hair(mask_path(face_name, "color", color_name)))
         need_face_fs = not fs_path("face", face_name).exists()
         need_shape_fs = not fs_path("shape", shape_name).exists()
         need_color_fs = not fs_path("color", color_name).exists()
@@ -383,19 +422,21 @@ def ensure_dataset_cache_v8(triplets: list[tuple[str, str, str]]):
                 align_cache_name(face_name, "color", color_name),
                 latent_F=align_color["latent_F_align"],
             )
-        if USER_FORCE_REFRESH_ALIGN_CACHE or (not mask_path(face_name, "shape", shape_name).exists()):
+        if USER_FORCE_REFRESH_ALIGN_CACHE or (not mask_has_target_hair(mask_path(face_name, "shape", shape_name))):
             save_latents(
                 ACTIVE_DATASET_DIR,
                 "Masks",
                 align_cache_name(face_name, "shape", shape_name),
                 remove_mask=build_remove_protect_mask(align_shape),
+                target_hair=align_shape["HM_X"].float(),
             )
-        if USER_FORCE_REFRESH_ALIGN_CACHE or (not mask_path(face_name, "color", color_name).exists()):
+        if USER_FORCE_REFRESH_ALIGN_CACHE or (not mask_has_target_hair(mask_path(face_name, "color", color_name))):
             save_latents(
                 ACTIVE_DATASET_DIR,
                 "Masks",
                 align_cache_name(face_name, "color", color_name),
                 remove_mask=build_remove_protect_mask(align_color),
+                target_hair=align_color["HM_X"].float(),
             )
 
     del hair_fast
@@ -424,6 +465,30 @@ def mask_to_preview(mask: torch.Tensor) -> torch.Tensor:
     return mask * 2 - 1
 
 
+PARSING_HAIR_LABEL = 10
+PARSING_HAT_LABEL = 11
+PARSING_FACE_PROTECT_LABELS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 12)
+PARSING_NECK_PROTECT_LABELS = (13, 14)
+PARSING_BODY_PROTECT_LABELS = (15,)
+PARSING_SKIN_PROTECT_LABELS = PARSING_FACE_PROTECT_LABELS + PARSING_NECK_PROTECT_LABELS
+PARSING_SUBJECT_PROTECT_LABELS = PARSING_SKIN_PROTECT_LABELS + PARSING_BODY_PROTECT_LABELS
+
+
+def parsing_label_mask(parsing_mask: torch.Tensor, labels: tuple[int, ...]) -> torch.Tensor:
+    mask = torch.zeros_like(parsing_mask, dtype=torch.bool)
+    for label in labels:
+        mask |= parsing_mask == label
+    return mask.float()
+
+
+def dilate_mask(mask: torch.Tensor, width: int) -> torch.Tensor:
+    if width <= 0:
+        return mask.float().clamp(0, 1)
+    if mask.dim() == 3:
+        mask = mask.unsqueeze(1)
+    return tnf.max_pool2d(mask.float(), kernel_size=2 * width + 1, stride=1, padding=width).clamp(0, 1)
+
+
 class MaskPrepHelper:
     def __init__(self, device: torch.device):
         self.device = device
@@ -450,14 +515,44 @@ class MaskPrepHelper:
     def generate_mask(self, image: torch.Tensor, return_keep: bool = False):
         image_512 = (self.downsample_512((image + 1) / 2) - seg_mean) / seg_std
         down_seg, _, _ = self.seg(image_512)
-        current_mask = torch.argmax(down_seg, dim=1).long().float()
-        hair_mask = torch.where(current_mask == 10, torch.ones_like(current_mask), torch.zeros_like(current_mask))
+        current_mask = torch.argmax(down_seg, dim=1).long()
+        hair_mask = torch.where(
+            current_mask == PARSING_HAIR_LABEL,
+            torch.ones_like(current_mask, dtype=torch.float32),
+            torch.zeros_like(current_mask, dtype=torch.float32),
+        )
         hair_mask = tnf.interpolate(hair_mask.unsqueeze(1), size=(256, 256), mode="nearest")
         hair_mask_dilate, hair_mask_erode = self.dilate_erosion.mask(hair_mask)
         if return_keep:
-            non_hair_subject = ((current_mask > 0) & (current_mask != 10)).float()
+            non_hair_subject = (
+                (current_mask > 0)
+                & (current_mask != PARSING_HAIR_LABEL)
+                & (current_mask != PARSING_HAT_LABEL)
+            ).float()
+            subject_guard = parsing_label_mask(current_mask, PARSING_SUBJECT_PROTECT_LABELS)
+            skin_guard = parsing_label_mask(current_mask, PARSING_SKIN_PROTECT_LABELS)
+            face_guard = parsing_label_mask(current_mask, PARSING_FACE_PROTECT_LABELS)
+            neck_guard = parsing_label_mask(current_mask, PARSING_NECK_PROTECT_LABELS)
+
             non_hair_subject = tnf.interpolate(non_hair_subject.unsqueeze(1), size=(256, 256), mode="nearest")
-            return hair_mask_dilate, hair_mask_erode, non_hair_subject.clamp(0, 1)
+            subject_guard = tnf.interpolate(subject_guard.unsqueeze(1), size=(256, 256), mode="nearest")
+            skin_guard = tnf.interpolate(skin_guard.unsqueeze(1), size=(256, 256), mode="nearest")
+            face_guard = tnf.interpolate(face_guard.unsqueeze(1), size=(256, 256), mode="nearest")
+            neck_guard = tnf.interpolate(neck_guard.unsqueeze(1), size=(256, 256), mode="nearest")
+
+            subject_guard = dilate_mask(subject_guard, 2)
+            skin_guard = dilate_mask(skin_guard, 2)
+            face_guard = dilate_mask(face_guard, 2)
+            neck_guard = dilate_mask(neck_guard, 2)
+            return (
+                hair_mask_dilate,
+                hair_mask_erode,
+                non_hair_subject.clamp(0, 1),
+                subject_guard.clamp(0, 1),
+                skin_guard.clamp(0, 1),
+                face_guard.clamp(0, 1),
+                neck_guard.clamp(0, 1),
+            )
         return hair_mask_dilate, hair_mask_erode
 
 
@@ -467,18 +562,42 @@ def prepare_item(exp, dataset_dir: Path, face_root: Path, color_root: Path):
     try:
         color_s = torch.from_numpy(np.load(dataset_dir / "FS" / fs_cache_name("color", color_name))["latent_in"]).squeeze(0)
         align_s = torch.from_numpy(np.load(dataset_dir / "FS" / fs_cache_name("face", face_name))["latent_in"]).squeeze(0)
-        align_f = torch.from_numpy(
+        align_f_shape = torch.from_numpy(
             np.load(dataset_dir / "Align" / align_cache_name(face_name, "shape", shape_name))["latent_F"]
         ).squeeze(0)
-        remove_mask = torch.from_numpy(
-            np.load(dataset_dir / "Masks" / align_cache_name(face_name, "shape", shape_name))["remove_mask"]
+        with np.load(dataset_dir / "Masks" / align_cache_name(face_name, "shape", shape_name)) as mask_data:
+            remove_mask_shape = torch.from_numpy(np.array(mask_data["remove_mask"])).squeeze(0)
+            if "target_hair" in mask_data.files:
+                target_hair_shape = torch.from_numpy(np.array(mask_data["target_hair"])).squeeze(0)
+            else:
+                target_hair_shape = torch.zeros_like(remove_mask_shape)
+
+        align_f_color = torch.from_numpy(
+            np.load(dataset_dir / "Align" / align_cache_name(face_name, "color", color_name))["latent_F"]
         ).squeeze(0)
+        with np.load(dataset_dir / "Masks" / align_cache_name(face_name, "color", color_name)) as mask_data:
+            remove_mask_color = torch.from_numpy(np.array(mask_data["remove_mask"])).squeeze(0)
+            if "target_hair" in mask_data.files:
+                target_hair_color = torch.from_numpy(np.array(mask_data["target_hair"])).squeeze(0)
+            else:
+                target_hair_color = torch.zeros_like(remove_mask_color)
 
         with Image.open(find_image_path(color_root, color_name)) as color_image:
             color_i = T.functional.normalize(T.functional.to_tensor(color_image.convert("RGB")), [0.5], [0.5])
         with Image.open(find_image_path(face_root, face_name)) as face_image:
             face_i = T.functional.normalize(T.functional.to_tensor(face_image.convert("RGB")), [0.5], [0.5])
-        return color_s, align_s, align_f, remove_mask, color_i, face_i
+        return (
+            color_s,
+            align_s,
+            align_f_shape,
+            remove_mask_shape,
+            target_hair_shape,
+            align_f_color,
+            remove_mask_color,
+            target_hair_color,
+            color_i,
+            face_i,
+        )
     except Exception as exc:
         print(exc, file=sys.stderr)
         return None
@@ -528,6 +647,19 @@ class BlendingTrainerV8:
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.helper = helper
+        self.color_config = ColorConditionConfigV8(
+            chroma_no_edit_threshold=USER_CHROMA_NO_EDIT_THRESHOLD_V8,
+            chroma_full_edit_threshold=USER_CHROMA_FULL_EDIT_THRESHOLD_V8,
+            lightness_no_edit_threshold=USER_LIGHTNESS_NO_EDIT_THRESHOLD_V8,
+            lightness_full_edit_threshold=USER_LIGHTNESS_FULL_EDIT_THRESHOLD_V8,
+            max_global_l_shift=USER_MAX_GLOBAL_L_SHIFT_V8,
+            min_safe_fraction=USER_MIN_SAFE_REFERENCE_FRACTION_V8,
+            highlight_mad_scale=USER_HIGHLIGHT_MAD_SCALE,
+            highlight_global_min_margin=USER_HIGHLIGHT_GLOBAL_MIN_MARGIN,
+            highlight_local_l_margin=USER_HIGHLIGHT_LOCAL_L_MARGIN,
+            highlight_local_c_margin=USER_HIGHLIGHT_LOCAL_C_MARGIN,
+            highlight_chroma_ratio=USER_HIGHLIGHT_CHROMA_RATIO,
+        )
         self.grad_accum_steps = int(USER_GRAD_ACCUM_STEPS)
         self.best_loss = float("inf")
         self.output_ckpt_dir = ACTIVE_OUTPUT_DIR / "checkpoints"
@@ -539,14 +671,47 @@ class BlendingTrainerV8:
             self.fid_calc = get_fid_calc(USER_FID_CACHE, str(USER_FID_DATASET), device=self.device)
 
     def prepare_batch(self, batch):
-        color_s, align_s, align_f, remove_mask, color_i, face_i = [item.to(self.device, non_blocking=True) for item in batch]
+        (
+            color_s,
+            align_s,
+            align_f_shape,
+            remove_mask_shape,
+            target_hair_shape,
+            align_f_color,
+            remove_mask_color,
+            target_hair_color,
+            color_i,
+            face_i,
+        ) = batch
+        del align_f_color, remove_mask_color, target_hair_color
+        align_f = align_f_shape
+        remove_mask = remove_mask_shape
+        target_hair = target_hair_shape
+        color_s, align_s, align_f, remove_mask, target_hair, color_i, face_i = [
+            item.to(self.device, non_blocking=True)
+            for item in (color_s, align_s, align_f, remove_mask, target_hair, color_i, face_i)
+        ]
         remove_mask = remove_mask.float().clamp(0, 1)
         if remove_mask.dim() == 3:
             remove_mask = remove_mask.unsqueeze(1)
+        target_hair = target_hair.float().clamp(0, 1)
+        if target_hair.dim() == 3:
+            target_hair = target_hair.unsqueeze(1)
 
         with torch.no_grad():
             hm_3d, hm_3e = self.helper.generate_mask(color_i)
-            hm_1d, _ = self.helper.generate_mask(face_i)
+            (
+                hm_1d,
+                _,
+                source_keep_mask,
+                source_subject_guard,
+                source_skin_guard,
+                source_face_guard,
+                source_neck_guard,
+            ) = self.helper.generate_mask(
+                face_i,
+                return_keep=True,
+            )
             i_x, _ = self.helper.net.generator(
                 [align_s],
                 input_is_latent=True,
@@ -555,57 +720,289 @@ class BlendingTrainerV8:
                 end_layer=8,
                 layer_in=align_f,
             )
-            hm_xd, _, face_keep_mask = self.helper.generate_mask(i_x, return_keep=True)
+            (
+                hm_xd,
+                hm_xe,
+                face_keep_mask,
+                target_subject_guard,
+                target_skin_guard,
+                target_face_guard,
+                target_neck_guard,
+            ) = self.helper.generate_mask(
+                i_x,
+                return_keep=True,
+            )
             i_x_256 = self.helper.downsample_256(i_x)
             face_i_256 = self.helper.downsample_256(face_i)
             color_i_256 = self.helper.downsample_256(color_i)
 
-        target_mask = (1 - hm_1d) * (1 - hm_3d) * (1 - hm_xd)
-        satd_protect_mask = (1.0 - hm_xd).clamp(0, 1)
-        color_transfer_mask = hm_xd.clamp(0, 1)
-        color_reference_mask = hm_3e.clamp(0, 1)
+        cached_hair_d, cached_hair_e = self.helper.dilate_erosion.mask(target_hair)
+        has_cached_hair = target_hair.flatten(1).sum(dim=1) >= USER_SAFE_HAIR_MIN_PIXELS
+        target_hair_d = torch.where(
+            has_cached_hair.view(-1, 1, 1, 1),
+            torch.maximum(hm_xd, cached_hair_d),
+            hm_xd,
+        ).clamp(0, 1)
+        target_hair_e = torch.where(
+            has_cached_hair.view(-1, 1, 1, 1),
+            torch.maximum(hm_xe, cached_hair_e),
+            hm_xe,
+        ).clamp(0, 1)
+
+        target_mask = (1 - hm_1d) * (1 - hm_3d) * (1 - target_hair_d)
+        neck_hair_override = (USER_TARGET_HAIR_NECK_OVERRIDE * target_hair_e).clamp(0, 1)
+        target_neck_visible = (target_neck_guard * (1.0 - neck_hair_override)).clamp(0, 1)
+        source_neck_visible = (source_neck_guard * (1.0 - neck_hair_override)).clamp(0, 1)
+        skin_color_block = (
+            target_face_guard
+            + target_neck_visible
+            + 0.55 * source_face_guard
+            + 0.55 * source_neck_visible
+        ).clamp(0, 1)
+        skin_protect_mask = (
+            target_face_guard
+            + target_neck_visible
+            + 0.45 * source_face_guard
+            + 0.45 * source_neck_visible
+        ).clamp(0, 1)
+        remove_color_block = (
+            remove_mask * (1.0 - target_hair_d)
+            + USER_REMOVE_BLOCK_IN_TARGET_HAIR * remove_mask * target_hair_d
+        ).clamp(0, 1)
+        color_transfer_eroded = (
+            target_hair_e
+            * (1.0 - remove_color_block)
+            * (1.0 - USER_FACE_NECK_COLOR_BLOCK * skin_color_block)
+        ).clamp(0, 1)
+        color_transfer_core = (
+            ((0.72 * target_hair_e) + (0.28 * target_hair_d))
+            * (1.0 - remove_color_block)
+            * (1.0 - USER_FACE_NECK_COLOR_BLOCK * skin_color_block)
+        ).clamp(0, 1)
+        color_transfer_fallback = (
+            target_hair_d
+            * (1.0 - 0.45 * remove_color_block)
+            * (1.0 - USER_FACE_NECK_COLOR_BLOCK * skin_color_block)
+        ).clamp(0, 1)
+        needs_fallback = color_transfer_eroded.flatten(1).sum(dim=1) < USER_SAFE_HAIR_MIN_PIXELS
+        color_transfer_mask = torch.where(
+            needs_fallback.view(-1, 1, 1, 1),
+            color_transfer_fallback,
+            color_transfer_core,
+        ).clamp(0, 1)
+        subject_protect_mask = (
+            (
+                face_keep_mask
+                + source_keep_mask
+                + target_subject_guard
+                + 0.60 * source_subject_guard
+                + target_skin_guard
+                + 0.50 * source_skin_guard
+            )
+            * (1.0 - color_transfer_mask)
+        ).clamp(0, 1)
+        skin_protect_mask = (skin_protect_mask * (1.0 - color_transfer_mask)).clamp(0, 1)
+        satd_protect_mask = (
+            remove_color_block
+            + subject_protect_mask
+            + skin_protect_mask
+            + 0.35 * target_mask
+            + 0.25 * (1.0 - target_hair_d) * (1.0 - hm_3e)
+        ).clamp(0, 1)
+        with torch.no_grad():
+            condition_bundle = build_color_condition_bundle(
+                reference_image=color_i_256,
+                reference_hair_mask=hm_3e,
+                base_image=i_x_256,
+                target_hair_mask=color_transfer_mask,
+                config=self.color_config,
+            )
+        color_reference_mask = condition_bundle["safe_ref_mask"]
 
         valid = color_reference_mask.flatten(1).any(dim=1) & color_transfer_mask.flatten(1).any(dim=1)
         if not valid.any():
             return None
 
-        return (
-            color_s[valid],
-            align_s[valid],
-            align_f[valid],
-            color_i_256[valid],
-            face_i_256[valid],
-            i_x_256[valid],
-            target_mask[valid],
-            satd_protect_mask[valid],
-            remove_mask[valid],
-            color_transfer_mask[valid],
-            face_keep_mask[valid],
-            hm_3e[valid],
-            color_reference_mask[valid],
-        )
+        return {
+            "color_s": color_s[valid],
+            "align_s": align_s[valid],
+            "align_f": align_f[valid],
+            "color_i": color_i_256[valid],
+            "face_i": face_i_256[valid],
+            "base_i": i_x_256[valid],
+            "target_mask": target_mask[valid],
+            "satd_protect_mask": satd_protect_mask[valid],
+            "remove_mask": remove_color_block[valid],
+            "color_transfer_mask": color_transfer_mask[valid],
+            "face_keep_mask": face_keep_mask[valid],
+            "skin_protect_mask": skin_protect_mask[valid],
+            "reference_hair_mask": hm_3e[valid],
+            "safe_ref_mask": condition_bundle["safe_ref_mask"][valid],
+            "rejected_highlight_mask": condition_bundle["rejected_highlight_mask"][valid],
+            "color_descriptor": condition_bundle["descriptor"][valid],
+            "chroma_need_gate": condition_bundle["chroma_need_gate"][valid],
+            "lightness_need_gate": condition_bundle["lightness_need_gate"][valid],
+            "edit_need_gate": condition_bundle["edit_need_gate"][valid],
+            "pseudo_lab": condition_bundle["pseudo_lab"][valid],
+            "pseudo_rgb": condition_bundle["pseudo_rgb"][valid],
+            "color_proxy": condition_bundle["color_proxy"][valid],
+            "condition_metrics": {
+                key: value[valid]
+                for key, value in condition_bundle["metrics"].items()
+            },
+        }
 
-    def calc_loss(self, i_gen, i_face, i_color, mask_face, mask_hair, gen_hair=None, *_, **__):
-        del gen_hair
-        mask_face = mask_face.float().clamp(0, 1)
-        mask_hair = mask_hair.float().clamp(0, 1)
-        if mask_face.size(1) == 1 and i_gen.size(1) != 1:
-            mask_face = mask_face.expand(-1, i_gen.size(1), -1, -1)
-        if mask_hair.size(1) == 1 and i_gen.size(1) != 1:
-            mask_hair = mask_hair.expand(-1, i_gen.size(1), -1, -1)
+    @staticmethod
+    def masked_l1(source: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        mask = mask.float().clamp(0, 1)
+        denom = mask.sum().clamp_min(1.0) * source.size(1)
+        return (torch.abs(source - target) * mask).sum() / denom
+
+    @staticmethod
+    def masked_smooth_l1(source: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        mask = mask.float().clamp(0, 1)
+        element_loss = tnf.smooth_l1_loss(source, target, reduction="none")
+        denominator = mask.sum().clamp_min(1.0) * source.size(1)
+        return (element_loss * mask).sum() / denominator
+
+    @staticmethod
+    def masked_mean_value(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        mask = mask.float().clamp(0, 1)
+        return (value * mask).sum() / (mask.sum().clamp_min(1.0) * value.size(1))
+
+    @staticmethod
+    def masked_fraction_above(value: torch.Tensor, mask: torch.Tensor, threshold: float) -> torch.Tensor:
+        mask = mask.float().clamp(0, 1)
+        return (((value > threshold).float() * mask).sum() / mask.sum().clamp_min(1.0))
+
+    @staticmethod
+    def masked_q95(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        per_sample = []
+        for sample_value, sample_mask in zip(value.detach(), mask.detach()):
+            selected = sample_value[sample_mask.expand_as(sample_value) > 0.05]
+            per_sample.append(torch.quantile(selected, 0.95) if selected.numel() else value.new_zeros(()))
+        return torch.stack(per_sample).mean()
+
+    def calc_loss(
+        self,
+        i_gen: torch.Tensor,
+        prepared: dict[str, object],
+        encoder_aux: dict[str, torch.Tensor],
+    ):
+        i_face = prepared["face_i"]
+        i_base = prepared["base_i"]
+        mask_face = prepared["target_mask"]
+        mask_gen_hair = prepared["color_transfer_mask"]
+        satd_protect_mask = prepared["satd_protect_mask"]
+        face_keep_mask = prepared["face_keep_mask"]
+        skin_protect_mask = prepared["skin_protect_mask"]
+        remove_mask = prepared["remove_mask"]
+        pseudo_lab = prepared["pseudo_lab"]
+        pseudo_rgb = prepared["pseudo_rgb"]
+
+        mask_gen_hair = mask_gen_hair.float().clamp(0, 1)
+        satd_protect_mask = satd_protect_mask.float().clamp(0, 1)
+        face_keep_mask = face_keep_mask.float().clamp(0, 1)
+        skin_protect_mask = skin_protect_mask.float().clamp(0, 1)
+        remove_mask = remove_mask.float().clamp(0, 1)
 
         gen_face_embed = self.model.get_image_embed(i_gen * mask_face)
         face_embed = self.model.get_image_embed(i_face * mask_face)
         face_loss = (1 - tnf.cosine_similarity(gen_face_embed, face_embed)).mean()
 
-        gen_hair_embed = self.model.get_image_embed(i_gen * mask_hair)
-        color_hair_embed = self.model.get_image_embed(i_color * mask_hair)
-        hair_loss = (1 - tnf.cosine_similarity(gen_hair_embed, color_hair_embed)).mean()
+        hair_loss = i_gen.sum() * 0.0
 
-        total_loss = USER_FACE_CLIP_LOSS_WEIGHT * face_loss + USER_HAIR_CLIP_LOSS_WEIGHT * hair_loss
+        gen_lab = rgb_to_lab(i_gen)
+        base_lab = rgb_to_lab(i_base)
+        gen_luma = gen_lab[:, 0:1]
+        base_luma = base_lab[:, 0:1]
+        gen_chroma = gen_lab[:, 1:3]
+        base_chroma = base_lab[:, 1:3]
+
+        pseudo_ab_loss = self.masked_smooth_l1(
+            gen_chroma / 110.0,
+            pseudo_lab[:, 1:3] / 110.0,
+            mask_gen_hair,
+        )
+        pseudo_rgb_loss = self.masked_l1(i_gen, pseudo_rgb, mask_gen_hair)
+        pseudo_luma_loss = self.masked_smooth_l1(
+            gen_luma / 100.0,
+            pseudo_lab[:, 0:1] / 100.0,
+            mask_gen_hair,
+        )
+        luma_excess = gen_luma - pseudo_lab[:, 0:1]
+        positive_luma = torch.relu(luma_excess - USER_LUMA_EXCESS_MARGIN)
+        positive_luma_loss = self.masked_mean_value(positive_luma / 100.0, mask_gen_hair)
+        hp_gen = gen_luma - gaussian_blur2d(gen_luma, radius=3)
+        hp_base = base_luma - gaussian_blur2d(base_luma, radius=3)
+        hf_luma_excess = torch.relu(
+            hp_gen.abs() - hp_base.abs() - USER_HF_LUMA_EXCESS_MARGIN
+        )
+        hf_luma_loss = self.masked_mean_value(hf_luma_excess / 100.0, mask_gen_hair)
+
+        face_keep_region = (face_keep_mask * satd_protect_mask).clamp(0, 1)
+        protect_region = (face_keep_region + remove_mask).clamp(0, 1)
+        face_keep_loss = self.masked_l1(i_gen, i_base, face_keep_region)
+        remove_keep_loss = self.masked_l1(i_gen, i_base, remove_mask)
+        protect_chroma_keep_loss = self.masked_l1(gen_chroma, base_chroma, protect_region)
+        skin_chroma_keep_loss = self.masked_l1(gen_chroma, base_chroma, skin_protect_mask)
+        skin_rgb_keep_loss = self.masked_l1(i_gen, i_base, skin_protect_mask)
+        correction_norm_loss = (
+            encoder_aux["correction_norm"]
+            / encoder_aux["direct_delta_norm"].clamp_min(1.0)
+        ).mean()
+
+        total_loss = (
+            USER_FACE_CLIP_LOSS_WEIGHT * face_loss
+            + USER_PSEUDO_AB_LOSS_WEIGHT * pseudo_ab_loss
+            + USER_PSEUDO_RGB_LOSS_WEIGHT * pseudo_rgb_loss
+            + USER_PSEUDO_LUMA_LOSS_WEIGHT * pseudo_luma_loss
+            + USER_POSITIVE_LUMA_EXCESS_WEIGHT * positive_luma_loss
+            + USER_HF_LUMA_EXCESS_WEIGHT * hf_luma_loss
+            + USER_FACE_KEEP_L1_LOSS_WEIGHT * face_keep_loss
+            + USER_REMOVE_KEEP_L1_LOSS_WEIGHT * remove_keep_loss
+            + USER_PROTECT_CHROMA_KEEP_LOSS_WEIGHT * protect_chroma_keep_loss
+            + USER_SKIN_CHROMA_KEEP_LOSS_WEIGHT * skin_chroma_keep_loss
+            + USER_SKIN_RGB_KEEP_LOSS_WEIGHT * skin_rgb_keep_loss
+            + USER_CORRECTION_NORM_WEIGHT * correction_norm_loss
+        )
         return total_loss, {
             "face_loss": face_loss,
             "hair_loss": hair_loss,
+            "pseudo_ab": pseudo_ab_loss,
+            "pseudo_rgb": pseudo_rgb_loss,
+            "pseudo_luma": pseudo_luma_loss,
+            "positive_luma": positive_luma_loss,
+            "hf_luma": hf_luma_loss,
+            "face_keep_l1": face_keep_loss,
+            "remove_keep_l1": remove_keep_loss,
+            "protect_chroma_keep": protect_chroma_keep_loss,
+            "skin_chroma_keep": skin_chroma_keep_loss,
+            "skin_rgb_keep": skin_rgb_keep_loss,
+            "correction_norm": correction_norm_loss,
+            "result_to_pseudo_ab_l2": self.masked_mean_value(
+                torch.linalg.vector_norm(gen_chroma - pseudo_lab[:, 1:3], dim=1, keepdim=True),
+                mask_gen_hair,
+            ),
+            "result_hue_error": self.masked_mean_value(
+                torch.rad2deg(
+                    torch.acos(
+                        (
+                            (gen_chroma * pseudo_lab[:, 1:3]).sum(dim=1, keepdim=True)
+                            / (
+                                torch.linalg.vector_norm(gen_chroma, dim=1, keepdim=True)
+                                * torch.linalg.vector_norm(pseudo_lab[:, 1:3], dim=1, keepdim=True)
+                            ).clamp_min(1e-4)
+                        ).clamp(-1, 1)
+                    )
+                ),
+                mask_gen_hair,
+            ),
+            "mean_l_excess": self.masked_mean_value(torch.relu(luma_excess), mask_gen_hair),
+            "q95_l_excess": self.masked_q95(luma_excess, mask_gen_hair),
+            "frac_l_excess_gt8": self.masked_fraction_above(luma_excess, mask_gen_hair, 8.0),
+            "frac_l_excess_gt12": self.masked_fraction_above(luma_excess, mask_gen_hair, 12.0),
+            "frac_l_excess_gt16": self.masked_fraction_above(luma_excess, mask_gen_hair, 16.0),
             "loss": total_loss,
         }
 
@@ -614,9 +1011,15 @@ class BlendingTrainerV8:
         saved_state_dict = {key: value for key, value in model_state_dict.items() if not key.startswith("clip_model.")}
         torch.save(
             {
+                "arch": DIRECT_COLOR_ARCH_V8_2,
                 "epoch": epoch,
                 "best_loss": best_loss,
                 "clip": USER_CLIP_MODEL,
+                "adapter_config": {
+                    "direct_mix_init": USER_DIRECT_MIX_INIT,
+                    "direct_mix_floor": USER_DIRECT_MIX_FLOOR,
+                    "correction_budget_ratio": USER_CORRECTION_BUDGET_RATIO,
+                },
                 "model_state_dict": saved_state_dict,
                 "optimizer_state_dict": self.optimizer.state_dict(),
             },
@@ -632,34 +1035,103 @@ class BlendingTrainerV8:
             raise FileNotFoundError(f"Cannot find USER_RESUME_CHECKPOINT: {resume_path}")
 
         checkpoint = torch.load(resume_path, map_location=self.device)
+        checkpoint_arch = checkpoint.get("arch") if isinstance(checkpoint, dict) else None
+        if checkpoint_arch != DIRECT_COLOR_ARCH_V8_2:
+            raise RuntimeError(
+                f"Refusing to resume incompatible BlendingV8 checkpoint {resume_path}: "
+                f"arch={checkpoint_arch!r}, required={DIRECT_COLOR_ARCH_V8_2!r}"
+            )
+        adapter_config = checkpoint.get("adapter_config", {})
+        expected_adapter_config = {
+            "direct_mix_init": self.model.direct_mix_init,
+            "direct_mix_floor": self.model.direct_mix_floor,
+            "correction_budget_ratio": self.model.correction_budget_ratio,
+        }
+        mismatched_config = {
+            key: (adapter_config[key], expected_value)
+            for key, expected_value in expected_adapter_config.items()
+            if key in adapter_config and float(adapter_config[key]) != float(expected_value)
+        }
+        if mismatched_config:
+            raise RuntimeError(
+                f"Resume adapter_config does not match current V2 config: {mismatched_config}"
+            )
         state_dict = checkpoint.get("model_state_dict", checkpoint)
-        loaded_keys = load_compatible_state_dict(self.model, state_dict)
+        report = load_direct_color_adapter_state_v8(self.model, state_dict)
 
         if "optimizer_state_dict" in checkpoint:
-            try:
-                self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            except (ValueError, RuntimeError) as exc:
-                print(
-                    f"[blending_v8] optimizer state is incompatible; reinitializing optimizer. {exc}",
-                    file=sys.stderr,
-                )
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
         self.best_loss = float(checkpoint.get("best_loss", self.best_loss))
         start_epoch = int(checkpoint.get("epoch", 0))
         print(
             f"[blending_v8] resumed from {resume_path} "
-            f"with {len(loaded_keys)} compatible tensors; "
+            f"with {len(report['loaded'])} strict V2 adapter tensors; "
             f"start_epoch={start_epoch + 1} best_loss={self.best_loss:.6f}",
             file=sys.stderr,
         )
         return start_epoch
 
+    @staticmethod
+    def build_generator_latent(align_s: torch.Tensor, blend_s: torch.Tensor) -> torch.Tensor:
+        # This matches the author's training code. With start_layer=4 the
+        # prefix is not rendered, but keeping the contract explicit avoids
+        # accidental dependence if the generator call changes later.
+        if USER_AUTHOR_ZERO_PREFIX_TRAIN:
+            prefix = torch.zeros_like(align_s[:, :6])
+        else:
+            prefix = align_s[:, :6]
+        return torch.cat((prefix, blend_s), dim=1)
+
+    def configure_stage(self, epoch: int) -> tuple[str, bool]:
+        stage_a = epoch < USER_STAGE_A_EPOCHS
+        correction_enabled = not stage_a
+        learning_rate = USER_LR_STAGE_A if stage_a else USER_LR_STAGE_B
+        self.model.set_correction_trainable(correction_enabled)
+        for parameter_group in self.optimizer.param_groups:
+            parameter_group["lr"] = learning_rate
+        return ("A" if stage_a else "B"), correction_enabled
+
+    def run_adapter(
+        self,
+        prepared: dict[str, object],
+        *,
+        correction_enabled: bool,
+        layer_mix_override: float | None = None,
+    ):
+        return self.model(
+            latent_face=prepared["align_s"][:, 6:],
+            latent_color=prepared["color_s"][:, 6:],
+            color_descriptor=prepared["color_descriptor"],
+            chroma_need_gate=prepared["chroma_need_gate"],
+            lightness_need_gate=prepared["lightness_need_gate"],
+            edit_need_gate=prepared["edit_need_gate"],
+            correction_enabled=correction_enabled,
+            layer_mix_override=layer_mix_override,
+            return_aux=True,
+        )
+
+    def render_blend_tail(self, prepared: dict[str, object], blend_s: torch.Tensor) -> torch.Tensor:
+        latent_in = self.build_generator_latent(prepared["align_s"], blend_s)
+        image, _ = self.helper.net.generator(
+            [latent_in],
+            input_is_latent=True,
+            return_latents=False,
+            start_layer=4,
+            end_layer=8,
+            layer_in=prepared["align_f"],
+        )
+        return self.helper.downsample_256(image)
+
     def train_one_epoch(self, epoch: int):
+        stage, correction_enabled = self.configure_stage(epoch)
         self.model.train()
+        self.model.clip_model.eval()
         running_loss = 0.0
         running_steps = 0
         accumulated_batches = 0
         last_grad_norm = 0.0
+        running_metrics: dict[str, float] = {}
         self.optimizer.zero_grad(set_to_none=True)
         progress = tqdm(self.train_loader, desc=f"Blend train {epoch + 1}/{USER_EPOCHS}", leave=False)
         for batch in progress:
@@ -667,42 +1139,20 @@ class BlendingTrainerV8:
             if prepared is None:
                 continue
 
-            (
-                color_s,
-                align_s,
-                align_f,
-                color_i,
-                face_i,
-                i_x_256,
-                target_mask,
-                satd_protect_mask,
-                _remove_mask,
-                color_transfer_mask,
-                face_keep_mask,
-                hm_3e,
-                color_ref_mask,
-            ) = prepared
-            bsz = color_s.size(0)
-
-            blend_s = self.model(align_s[:, 6:], color_s[:, 6:], face_i * target_mask, color_i * hm_3e)
-            latent_in = torch.cat((torch.zeros(bsz, 6, 512, device=self.device), blend_s), axis=1)
+            blend_s, encoder_aux = self.run_adapter(
+                prepared,
+                correction_enabled=correction_enabled,
+            )
+            latent_in = self.build_generator_latent(prepared["align_s"], blend_s)
             i_g, _ = self.helper.net.generator(
                 [latent_in],
                 input_is_latent=True,
                 return_latents=False,
                 start_layer=4,
                 end_layer=8,
-                layer_in=align_f,
+                layer_in=prepared["align_f"],
             )
-            i_g_256 = self.helper.downsample_256(i_g)
-            loss, loss_info = self.calc_loss(
-                i_g_256,
-                face_i,
-                color_i,
-                target_mask,
-                hm_3e,
-                hm_3e,
-            )
+            loss, loss_info = self.calc_loss(self.helper.downsample_256(i_g), prepared, encoder_aux)
 
             (loss / self.grad_accum_steps).backward()
             accumulated_batches += 1
@@ -715,10 +1165,31 @@ class BlendingTrainerV8:
 
             running_loss += float(loss.item())
             running_steps += 1
+            batch_metrics = {
+                "loss_pseudo_ab": loss_info["pseudo_ab"],
+                "loss_pseudo_rgb": loss_info["pseudo_rgb"],
+                "loss_pseudo_luma": loss_info["pseudo_luma"],
+                "loss_positive_luma": loss_info["positive_luma"],
+                "loss_hf_luma": loss_info["hf_luma"],
+                "loss_correction_norm": loss_info["correction_norm"],
+                "mean_chroma_need_gate": prepared["chroma_need_gate"].mean(),
+                "mean_lightness_need_gate": prepared["lightness_need_gate"].mean(),
+                "mean_edit_need_gate": prepared["edit_need_gate"].mean(),
+                "mean_safe_fraction": prepared["condition_metrics"]["safe_fraction"].mean(),
+                "mean_direct_component_norm": encoder_aux["direct_component_norm"].mean(),
+                "mean_correction_norm": encoder_aux["correction_norm"].mean(),
+                "mean_layer_mix": encoder_aux["layer_mix_mean"].mean(),
+            }
+            for key, value in batch_metrics.items():
+                running_metrics[key] = running_metrics.get(key, 0.0) + float(value.item())
             progress.set_postfix(
                 loss=float(loss.item()),
-                face=float(loss_info["face_loss"].item()),
-                hair=float(loss_info["hair_loss"].item()),
+                ab=float(loss_info["pseudo_ab"].item()),
+                rgb=float(loss_info["pseudo_rgb"].item()),
+                luma=float(loss_info["pseudo_luma"].item()),
+                excess=float(loss_info["positive_luma"].item()),
+                gate=float(prepared["edit_need_gate"].mean().item()),
+                skin=float(loss_info["skin_chroma_keep"].item()),
                 grad=last_grad_norm,
                 accum=f"{accumulated_batches}/{self.grad_accum_steps}",
             )
@@ -733,96 +1204,206 @@ class BlendingTrainerV8:
             self.optimizer.step()
             self.optimizer.zero_grad(set_to_none=True)
 
+        averaged_metrics = {
+            key: value / max(running_steps, 1)
+            for key, value in running_metrics.items()
+        }
+        print(
+            f"[blending_v8] epoch={epoch + 1} stage={stage} "
+            f"lr={self.optimizer.param_groups[0]['lr']:.2e} correction={correction_enabled} train_components "
+            + " ".join(f"{key}={value:.6f}" for key, value in averaged_metrics.items())
+        )
         return running_loss / max(running_steps, 1)
 
     @torch.no_grad()
-    def validate(self, epoch: int):
+    def validate(
+        self,
+        epoch: int,
+        *,
+        correction_enabled: bool | None = None,
+        output_dir_name: str | None = None,
+    ):
+        if correction_enabled is None:
+            correction_enabled = epoch >= USER_STAGE_A_EPOCHS
+        validation_label = "pretrain" if epoch < 0 else f"{epoch + 1}/{USER_EPOCHS}"
         self.model.eval()
-        total_losses = {
-            "face_loss": 0.0,
-            "hair_loss": 0.0,
-            "loss": 0.0,
-        }
+        total_losses: dict[str, float] = {}
+        total_diagnostics: dict[str, float] = {}
         total_steps = 0
         images_to_fid = []
         preview_rows = []
+        direct_preview_rows = []
+        validation_records = []
 
-        for batch in tqdm(self.val_loader, desc=f"Blend val {epoch + 1}/{USER_EPOCHS}", leave=False):
+        for batch in tqdm(self.val_loader, desc=f"Blend val {validation_label}", leave=False):
             prepared = self.prepare_batch(batch)
             if prepared is None:
                 continue
 
-            (
-                color_s,
-                align_s,
-                align_f,
-                color_i,
-                face_i,
-                i_x_256,
-                target_mask,
-                satd_protect_mask,
-                _remove_mask,
-                color_transfer_mask,
-                face_keep_mask,
-                hm_3e,
-                color_ref_mask,
-            ) = prepared
-            bsz = color_s.size(0)
-
-            blend_s = self.model(align_s[:, 6:], color_s[:, 6:], face_i * target_mask, color_i * hm_3e)
-            latent_in = torch.cat((torch.zeros(bsz, 6, 512, device=self.device), blend_s), axis=1)
+            bsz = prepared["color_s"].size(0)
+            blend_s, encoder_aux = self.run_adapter(
+                prepared,
+                correction_enabled=correction_enabled,
+            )
+            latent_in = self.build_generator_latent(prepared["align_s"], blend_s)
             i_g, _ = self.helper.net.generator(
                 [latent_in],
                 input_is_latent=True,
                 return_latents=False,
                 start_layer=4,
                 end_layer=8,
-                layer_in=align_f,
+                layer_in=prepared["align_f"],
             )
             i_g_256 = self.helper.downsample_256(i_g)
-            loss, loss_info = self.calc_loss(
-                i_g_256,
-                face_i,
-                color_i,
-                target_mask,
-                hm_3e,
-                hm_3e,
-            )
+            loss, loss_info = self.calc_loss(i_g_256, prepared, encoder_aux)
 
             for key, value in loss_info.items():
                 total_losses[key] = total_losses.get(key, 0.0) + float(value.item())
+            batch_diagnostics = {
+                "mean_chroma_need_gate": prepared["chroma_need_gate"].mean(),
+                "mean_lightness_need_gate": prepared["lightness_need_gate"].mean(),
+                "mean_edit_need_gate": prepared["edit_need_gate"].mean(),
+                "mean_safe_fraction": prepared["condition_metrics"]["safe_fraction"].mean(),
+                "mean_rejected_fraction": prepared["condition_metrics"]["rejected_fraction"].mean(),
+                "mean_direct_delta_norm": encoder_aux["direct_delta_norm"].mean(),
+                "mean_direct_component_norm": encoder_aux["direct_component_norm"].mean(),
+                "mean_correction_norm": encoder_aux["correction_norm"].mean(),
+                "mean_layer_mix": encoder_aux["layer_mix_mean"].mean(),
+            }
+            for key, value in batch_diagnostics.items():
+                total_diagnostics[key] = total_diagnostics.get(key, 0.0) + float(value.item())
             total_steps += 1
 
             if self.fid_calc is not None:
                 images_to_fid.append(T.Resize((299, 299))(((i_g + 1) / 2).clamp(0, 1)))
 
+            generated_lab = rgb_to_lab(i_g_256)
+            luma_excess = generated_lab[:, 0:1] - prepared["pseudo_lab"][:, 0:1]
             if len(preview_rows) < USER_LOG_IMAGE_COUNT:
+                full_direct_s, _ = self.run_adapter(
+                    prepared,
+                    correction_enabled=False,
+                    layer_mix_override=1.0,
+                )
+                initial_direct_s, _ = self.run_adapter(
+                    prepared,
+                    correction_enabled=False,
+                    layer_mix_override=USER_DIRECT_MIX_INIT,
+                )
+                full_direct_i = self.render_blend_tail(prepared, full_direct_s)
+                initial_direct_i = self.render_blend_tail(prepared, initial_direct_s)
                 for idx in range(bsz):
+                    excess_preview = (
+                        (torch.relu(luma_excess[idx : idx + 1]) / 20.0).clamp(0, 1) * 2.0 - 1.0
+                    ).repeat(1, 3, 1, 1)
                     preview_rows.append([
-                        face_i[idx : idx + 1],
-                        color_i[idx : idx + 1],
-                        i_x_256[idx : idx + 1],
+                        prepared["face_i"][idx : idx + 1],
+                        prepared["color_i"][idx : idx + 1],
+                        prepared["base_i"][idx : idx + 1],
                         i_g_256[idx : idx + 1],
-                        mask_to_preview(color_transfer_mask[idx : idx + 1]),
+                        mask_to_preview(prepared["color_transfer_mask"][idx : idx + 1]),
+                        mask_to_preview(prepared["reference_hair_mask"][idx : idx + 1]),
+                        mask_to_preview(prepared["safe_ref_mask"][idx : idx + 1]),
+                        mask_to_preview(prepared["rejected_highlight_mask"][idx : idx + 1]),
+                        prepared["pseudo_rgb"][idx : idx + 1],
+                        excess_preview,
+                    ])
+                    direct_preview_rows.append([
+                        prepared["base_i"][idx : idx + 1],
+                        full_direct_i[idx : idx + 1],
+                        initial_direct_i[idx : idx + 1],
+                        i_g_256[idx : idx + 1],
                     ])
                     if len(preview_rows) >= USER_LOG_IMAGE_COUNT:
                         break
 
+            for idx in range(bsz):
+                sample_mask = prepared["color_transfer_mask"][idx : idx + 1]
+                sample_gen_ab = generated_lab[idx : idx + 1, 1:3]
+                sample_pseudo_ab = prepared["pseudo_lab"][idx : idx + 1, 1:3]
+                hue_cosine = (
+                    (sample_gen_ab * sample_pseudo_ab).sum(dim=1, keepdim=True)
+                    / (
+                        torch.linalg.vector_norm(sample_gen_ab, dim=1, keepdim=True)
+                        * torch.linalg.vector_norm(sample_pseudo_ab, dim=1, keepdim=True)
+                    ).clamp_min(1e-4)
+                ).clamp(-1, 1)
+                sample_excess = luma_excess[idx : idx + 1]
+                validation_records.append({
+                    "sample_index": len(validation_records),
+                    "ref_base_ab_distance": float(
+                        prepared["condition_metrics"]["ref_base_ab_distance"][idx].item()
+                    ),
+                    "delta_L_global": float(prepared["condition_metrics"]["delta_l_global"][idx].item()),
+                    "chroma_need_gate": float(prepared["chroma_need_gate"][idx].item()),
+                    "lightness_need_gate": float(prepared["lightness_need_gate"][idx].item()),
+                    "edit_need_gate": float(prepared["edit_need_gate"][idx].item()),
+                    "safe_fraction": float(prepared["condition_metrics"]["safe_fraction"][idx].item()),
+                    "rejected_fraction": float(
+                        prepared["condition_metrics"]["rejected_fraction"][idx].item()
+                    ),
+                    "result_to_pseudo_ab_l2": float(self.masked_mean_value(
+                        torch.linalg.vector_norm(sample_gen_ab - sample_pseudo_ab, dim=1, keepdim=True),
+                        sample_mask,
+                    ).item()),
+                    "result_hue_error": float(self.masked_mean_value(
+                        torch.rad2deg(torch.acos(hue_cosine)), sample_mask
+                    ).item()),
+                    "mean_L_excess": float(self.masked_mean_value(torch.relu(sample_excess), sample_mask).item()),
+                    "q95_L_excess": float(self.masked_q95(sample_excess, sample_mask).item()),
+                    "frac_L_excess_gt8": float(self.masked_fraction_above(sample_excess, sample_mask, 8.0).item()),
+                    "frac_L_excess_gt12": float(self.masked_fraction_above(sample_excess, sample_mask, 12.0).item()),
+                    "frac_L_excess_gt16": float(self.masked_fraction_above(sample_excess, sample_mask, 16.0).item()),
+                    "direct_delta_norm": float(encoder_aux["direct_delta_norm"][idx].item()),
+                    "direct_component_norm": float(encoder_aux["direct_component_norm"][idx].item()),
+                    "direct_mix_fraction": float(encoder_aux["direct_mix_fraction"][idx].item()),
+                    "layer_mix_mean": float(encoder_aux["layer_mix_mean"][idx].item()),
+                    "layer_mix_min": float(encoder_aux["layer_mix_min"][idx].item()),
+                    "layer_mix_max": float(encoder_aux["layer_mix_max"][idx].item()),
+                    "correction_raw_norm": float(encoder_aux["correction_raw_norm"][idx].item()),
+                    "correction_norm": float(encoder_aux["correction_norm"][idx].item()),
+                    "correction_budget": float(encoder_aux["correction_budget"][idx].item()),
+                    "correction_budget_scale": float(encoder_aux["correction_budget_scale"][idx].item()),
+                    "correction_to_direct_ratio": float(
+                        encoder_aux["correction_to_direct_ratio"][idx].item()
+                    ),
+                    "total_delta_norm": float(encoder_aux["total_delta_norm"][idx].item()),
+                    "total_to_direct_ratio": float(encoder_aux["total_to_direct_ratio"][idx].item()),
+                })
+
         avg_losses = {key: value / max(total_steps, 1) for key, value in total_losses.items()}
+        avg_diagnostics = {key: value / max(total_steps, 1) for key, value in total_diagnostics.items()}
         if self.fid_calc is not None and images_to_fid:
             avg_losses["fid_clip"] = float(self.fid_calc(torch.cat(images_to_fid)).item())
 
-        if epoch % USER_SAVE_PREVIEW_EVERY == 0:
-            epoch_dir = self.output_val_dir / f"epoch_{epoch + 1:03d}"
-            epoch_dir.mkdir(parents=True, exist_ok=True)
+        epoch_dir = self.output_val_dir / (
+            output_dir_name if output_dir_name is not None else f"epoch_{epoch + 1:03d}"
+        )
+        epoch_dir.mkdir(parents=True, exist_ok=True)
+        with open(epoch_dir / "metrics.json", "w", encoding="utf-8") as handle:
+            json.dump(validation_records, handle, ensure_ascii=False, indent=2)
+        if epoch < 0 or epoch % USER_SAVE_PREVIEW_EVERY == 0:
             for idx, row in enumerate(preview_rows):
                 save_preview(epoch_dir / f"sample_{idx:03d}.png", row)
+                save_preview(epoch_dir / f"sample_{idx:03d}_direct_diagnostic.png", direct_preview_rows[idx])
 
         print(
-            f"[blending_v8] epoch={epoch + 1} "
+            f"[blending_v8] validation={validation_label} correction={correction_enabled} "
             f"val_loss={avg_losses['loss']:.6f} "
             f"val_face={avg_losses['face_loss']:.6f} "
-            f"val_hair={avg_losses['hair_loss']:.6f}"
+            f"val_hair={avg_losses['hair_loss']:.6f} "
+            f"loss_pseudo_ab={avg_losses['pseudo_ab']:.6f} "
+            f"loss_pseudo_rgb={avg_losses['pseudo_rgb']:.6f} "
+            f"loss_pseudo_luma={avg_losses['pseudo_luma']:.6f} "
+            f"loss_positive_luma={avg_losses['positive_luma']:.6f} "
+            f"loss_hf_luma={avg_losses['hf_luma']:.6f} "
+            f"mean_edit_need_gate={avg_diagnostics['mean_edit_need_gate']:.6f} "
+            f"mean_safe_fraction={avg_diagnostics['mean_safe_fraction']:.6f} "
+            f"mean_direct_component_norm={avg_diagnostics['mean_direct_component_norm']:.6f} "
+            f"mean_correction_norm={avg_diagnostics['mean_correction_norm']:.6f} "
+            f"val_ab_error={avg_losses['result_to_pseudo_ab_l2']:.6f} "
+            f"val_frac_excess_gt12={avg_losses['frac_l_excess_gt12']:.6f} "
+            f"val_skin={avg_losses['skin_chroma_keep']:.6f}"
         )
         return avg_losses["loss"]
 
@@ -836,9 +1417,20 @@ class BlendingTrainerV8:
             )
             return
 
+        if start_epoch == 0:
+            self.configure_stage(0)
+            self.validate(
+                -1,
+                correction_enabled=False,
+                output_dir_name="epoch_000_pretrain",
+            )
+
         for epoch in range(start_epoch, USER_EPOCHS):
             train_loss = self.train_one_epoch(epoch)
-            val_loss = self.validate(epoch)
+            val_loss = self.validate(
+                epoch,
+                correction_enabled=epoch >= USER_STAGE_A_EPOCHS,
+            )
             print(f"[blending_v8] epoch={epoch + 1} train_loss={train_loss:.6f}")
 
             is_best = val_loss <= self.best_loss
@@ -891,19 +1483,50 @@ def main():
         drop_last=False,
     )
 
-    model = BlendingModel(USER_CLIP_MODEL)
-    init_ckpt = resolve_init_blending_checkpoint()
-    ckpt = torch.load(init_ckpt, map_location=device)
-    loaded_keys = load_compatible_state_dict(model, ckpt.get("model_state_dict", ckpt))
-    print(f"[blending_v8] initialized from {init_ckpt} with {len(loaded_keys)} compatible tensors", file=sys.stderr)
-    optimizer = torch.optim.Adam(model.parameters(), lr=USER_LR, weight_decay=USER_WEIGHT_DECAY)
+    model = BlendingModel(
+        USER_CLIP_MODEL,
+        direct_mix_init=USER_DIRECT_MIX_INIT,
+        direct_mix_floor=USER_DIRECT_MIX_FLOOR,
+        correction_budget_ratio=USER_CORRECTION_BUDGET_RATIO,
+    )
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=USER_LR_STAGE_A,
+        weight_decay=USER_WEIGHT_DECAY,
+    )
 
     trainer = BlendingTrainerV8(model, optimizer, train_loader, val_loader, helper)
     print(
-        f"[blending_v8] train_on_shape_satd_align=True color_ref_geometry=False use_satd_v8={USER_USE_SATD_V8} "
+        f"[blending_v8] train_on_shape_satd_align=True "
+        f"author_color_align_aux={USER_AUTHOR_COLOR_ALIGN_BATCH_PROB > 0} use_satd_v8={USER_USE_SATD_V8} "
+        f"arch={DIRECT_COLOR_ARCH_V8_2} fresh_adapter=True "
         f"satd_checkpoint={USER_SATD_CHECKPOINT_V8} "
         f"batch_size={USER_BATCH_SIZE} grad_accum_steps={USER_GRAD_ACCUM_STEPS} "
         f"effective_batch_size={USER_BATCH_SIZE * USER_GRAD_ACCUM_STEPS} "
+        f"pseudo_ab_w={USER_PSEUDO_AB_LOSS_WEIGHT} "
+        f"pseudo_rgb_w={USER_PSEUDO_RGB_LOSS_WEIGHT} "
+        f"pseudo_luma_w={USER_PSEUDO_LUMA_LOSS_WEIGHT} "
+        f"positive_luma_w={USER_POSITIVE_LUMA_EXCESS_WEIGHT} "
+        f"hf_luma_w={USER_HF_LUMA_EXCESS_WEIGHT} "
+        f"correction_norm_w={USER_CORRECTION_NORM_WEIGHT} "
+        f"chroma_gate_thresholds=({USER_CHROMA_NO_EDIT_THRESHOLD_V8},{USER_CHROMA_FULL_EDIT_THRESHOLD_V8}) "
+        f"lightness_gate_thresholds=({USER_LIGHTNESS_NO_EDIT_THRESHOLD_V8},{USER_LIGHTNESS_FULL_EDIT_THRESHOLD_V8}) "
+        f"max_global_l_shift={USER_MAX_GLOBAL_L_SHIFT_V8} "
+        f"min_safe_reference_fraction={USER_MIN_SAFE_REFERENCE_FRACTION_V8} "
+        f"direct_mix_init={USER_DIRECT_MIX_INIT} "
+        f"direct_mix_floor={USER_DIRECT_MIX_FLOOR} "
+        f"correction_budget_ratio={USER_CORRECTION_BUDGET_RATIO} "
+        f"stage_a_epochs={USER_STAGE_A_EPOCHS} "
+        f"lr_stage_a={USER_LR_STAGE_A} lr_stage_b={USER_LR_STAGE_B} "
+        f"remove_keep_w={USER_REMOVE_KEEP_L1_LOSS_WEIGHT} "
+        f"protect_chroma_keep_w={USER_PROTECT_CHROMA_KEEP_LOSS_WEIGHT} "
+        f"skin_chroma_keep_w={USER_SKIN_CHROMA_KEEP_LOSS_WEIGHT} "
+        f"skin_rgb_keep_w={USER_SKIN_RGB_KEEP_LOSS_WEIGHT} "
+        f"remove_block_in_target_hair={USER_REMOVE_BLOCK_IN_TARGET_HAIR} "
+        f"face_neck_color_block={USER_FACE_NECK_COLOR_BLOCK} "
+        f"target_hair_neck_override={USER_TARGET_HAIR_NECK_OVERRIDE} "
+        f"author_color_align_batch_prob={USER_AUTHOR_COLOR_ALIGN_BATCH_PROB} "
+        f"author_zero_prefix_train={USER_AUTHOR_ZERO_PREFIX_TRAIN} "
         f"resume_checkpoint={USER_RESUME_CHECKPOINT or '<none>'}",
         file=sys.stderr,
     )

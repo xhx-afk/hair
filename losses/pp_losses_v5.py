@@ -59,6 +59,16 @@ def masked_non_darker(pred_gray: torch.Tensor, anchor_gray: torch.Tensor, mask: 
     return masked_mean(F.relu(anchor_gray - pred_gray), mask)
 
 
+def masked_non_brighter(
+    pred_gray: torch.Tensor,
+    anchor_gray: torch.Tensor,
+    mask: torch.Tensor,
+    margin: float = 0.02,
+) -> torch.Tensor:
+    mask = resize_mask(mask, pred_gray.shape[-2:])
+    return masked_mean(F.relu(pred_gray - anchor_gray - margin), mask)
+
+
 def parsing_label_mask(parsing: torch.Tensor | None, labels: tuple[int, ...]) -> torch.Tensor | None:
     if parsing is None:
         return None
@@ -191,6 +201,7 @@ class EarAwareLossBuilder(LossBuilderMulti):
         query_mask = aux.get("ear_detail_query_mask", aux.get("hair_safe_query_mask", aux.get("query_mask")))
         source_ear_mask = aux.get("source_earring_mask")
         earring_confident_mask = aux.get("earring_confident_mask", source_ear_mask)
+        earring_detail_mask = aux.get("earring_detail_mask", earring_confident_mask)
         earring_highlight_mask = aux.get("earring_highlight_mask")
         earring_reference = aux.get("earring_reference", source)
         revealed_skin_mask = aux.get("revealed_skin_mask")
@@ -200,24 +211,19 @@ class EarAwareLossBuilder(LossBuilderMulti):
         presence_logits = aux.get("presence_logits")
         presence_target = aux.get("presence_target")
         visible_ear_roi = aux.get("visible_ear_roi")
-        earring_valid_roi = aux.get("earring_valid_roi", visible_ear_roi)
         source_hair_block_mask = aux.get("source_hair_block_mask")
-        target_earring_suppress_mask = aux.get("target_earring_suppress_mask")
-        target_ear_hair_occlusion_mask = aux.get("target_ear_hair_occlusion_mask")
-        target_clean_01 = aux.get("target_clean_01")
         gamma = aux.get("gamma")
         beta = aux.get("beta")
 
         if query_mask is None or source_ear_mask is None:
             return losses
 
-        if earring_valid_roi is not None:
-            earring_valid_roi = resize_mask(earring_valid_roi, query_mask.shape[-2:])
-            query_mask = ensure_mask_4d(query_mask).float() * earring_valid_roi
-            source_ear_mask = ensure_mask_4d(source_ear_mask).float() * earring_valid_roi
-            earring_confident_mask = ensure_mask_4d(earring_confident_mask).float() * earring_valid_roi
-            if earring_highlight_mask is not None:
-                earring_highlight_mask = ensure_mask_4d(earring_highlight_mask).float() * earring_valid_roi
+        if visible_ear_roi is not None:
+            visible_ear_roi = ensure_mask_4d(visible_ear_roi).float()
+            query_mask = ensure_mask_4d(query_mask).float() * (0.25 + 0.75 * visible_ear_roi).clamp(0, 1)
+            source_ear_mask = ensure_mask_4d(source_ear_mask).float() * (0.35 + 0.65 * visible_ear_roi).clamp(0, 1)
+            earring_confident_mask = ensure_mask_4d(earring_confident_mask).float() * (0.25 + 0.75 * visible_ear_roi).clamp(0, 1)
+            earring_detail_mask = ensure_mask_4d(earring_detail_mask).float() * (0.35 + 0.65 * visible_ear_roi).clamp(0, 1)
 
         if source_hair_block_mask is not None and not uses_safe_query:
             source_hair_block_mask = resize_mask(source_hair_block_mask, query_mask.shape[-2:])
@@ -366,56 +372,47 @@ class EarAwareLossBuilder(LossBuilderMulti):
                     seam_mask,
                 )
 
-        earring_confident_mask = resize_mask(earring_confident_mask, gen_F_256_01.shape[-2:])
-        earring_reference = F.interpolate(earring_reference, size=gen_F_256_01.shape[-2:], mode="bilinear", align_corners=False)
-        if target_earring_suppress_mask is not None:
-            target_earring_suppress_mask = resize_mask(target_earring_suppress_mask, gen_F_256_01.shape[-2:])
-            if target_clean_01 is None:
-                target_clean_01 = low_pass_filter(target)
-            else:
-                target_clean_01 = F.interpolate(
-                    target_clean_01,
-                    size=gen_F_256_01.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                ).clamp(0, 1)
+        non_edit_low_weight = self.losses_dict.get("non_edit_low_anchor", 0.0)
+        non_edit_high_weight = self.losses_dict.get("non_edit_high_anchor", 0.0)
+        non_edit_non_dark_weight = self.losses_dict.get("non_edit_non_dark", 0.0)
+        if non_edit_low_weight > 0 or non_edit_high_weight > 0 or non_edit_non_dark_weight > 0:
+            query_mask_256 = resize_mask(query_mask, gen_F_256_01.shape[-2:])
+            edit_mask = query_mask_256
+            if cleanup_mask is not None:
+                edit_mask = torch.clamp(edit_mask + resize_mask(cleanup_mask, gen_F_256_01.shape[-2:]), 0, 1)
+            if revealed_skin_mask_256 is not None:
+                edit_mask = torch.clamp(edit_mask + revealed_skin_mask_256, 0, 1)
+            edit_dilate = int(self.losses_dict.get("non_edit_edit_dilate", 17))
+            non_edit_mask = (1.0 - dilate_mask(edit_mask, edit_dilate)).clamp(0, 1)
+            non_edit_erode = int(self.losses_dict.get("non_edit_erode", 9))
+            if non_edit_erode > 1:
+                non_edit_mask = erode_mask(non_edit_mask, non_edit_erode)
 
-            suppress_low_weight = self.losses_dict.get("target_earring_suppress_low", 0.0)
-            if suppress_low_weight > 0:
-                losses["target_earring_suppress_low"] = suppress_low_weight * masked_l1(
-                    low_pass_filter(gen_F_256_01),
-                    low_pass_filter(target_clean_01),
-                    target_earring_suppress_mask,
-                )
-
-            suppress_high_weight = self.losses_dict.get("target_earring_suppress_high", 0.0)
-            if suppress_high_weight > 0:
-                losses["target_earring_suppress_high"] = suppress_high_weight * masked_mean(
-                    high_pass_filter(gen_F_256_01).abs(),
-                    target_earring_suppress_mask,
-                )
-
-        occluded_hair_weight = self.losses_dict.get("occluded_hair_anchor", 0.0)
-        if occluded_hair_weight > 0 and target_ear_hair_occlusion_mask is not None:
-            occluded_hair_mask = resize_mask(
-                target_ear_hair_occlusion_mask,
-                gen_F_256_01.shape[-2:],
-            )
-            losses["occluded_hair_anchor"] = occluded_hair_weight * (
-                masked_l1(gen_F_256_01, target, occluded_hair_mask)
-                + 0.5 * masked_l1(
+            if non_edit_low_weight > 0:
+                losses["non_edit_low_anchor"] = non_edit_low_weight * masked_l1(
                     low_pass_filter(gen_F_256_01),
                     low_pass_filter(target),
-                    occluded_hair_mask,
+                    non_edit_mask,
                 )
-                + 0.25 * masked_l1(
+            if non_edit_high_weight > 0:
+                losses["non_edit_high_anchor"] = non_edit_high_weight * masked_l1(
                     high_pass_filter(gen_F_256_01),
                     high_pass_filter(target),
-                    occluded_hair_mask,
+                    non_edit_mask,
                 )
-            )
+            if non_edit_non_dark_weight > 0:
+                losses["non_edit_non_dark"] = non_edit_non_dark_weight * masked_non_darker(
+                    rgb_to_gray(gen_F_256_01),
+                    rgb_to_gray(target),
+                    non_edit_mask,
+                )
 
-        source_ear_for_detail = earring_confident_mask
+        earring_confident_mask = resize_mask(earring_confident_mask, gen_F_256_01.shape[-2:])
+        earring_detail_mask = resize_mask(earring_detail_mask, gen_F_256_01.shape[-2:])
+        earring_reference = F.interpolate(earring_reference, size=gen_F_256_01.shape[-2:], mode="bilinear", align_corners=False)
+        earring_detail_support = torch.clamp(dilate_mask(earring_detail_mask, 5) + 0.18 * earring_confident_mask, 0, 1)
+        non_earring_ear_mask = torch.clamp(query_mask * (1.0 - dilate_mask(earring_detail_mask, 7)), 0, 1)
+        source_ear_for_detail = earring_detail_support
         detail_mask = parsing_label_mask(aux.get("source_parsing"), RAW_DETAIL_LABELS)
         if detail_mask is not None:
             detail_mask = resize_mask(detail_mask, gen_F_256_01.shape[-2:])
@@ -427,6 +424,7 @@ class EarAwareLossBuilder(LossBuilderMulti):
             if cleanup_mask is not None:
                 detail_mask = detail_mask * (1 - cleanup_mask).clamp(0, 1)
             detail_mask = torch.clamp(detail_mask + source_ear_for_detail, 0, 1)
+            detail_low_mask = detail_mask * (1.0 - dilate_mask(earring_detail_support, 5)).clamp(0, 1)
 
             detail_high_weight = self.losses_dict.get("detail_high", 0.0)
             if detail_high_weight > 0:
@@ -441,16 +439,21 @@ class EarAwareLossBuilder(LossBuilderMulti):
                 losses["detail_low_anchor"] = detail_low_anchor_weight * masked_l1(
                     low_pass_filter(gen_F_256_01),
                     low_pass_filter(target),
-                    detail_mask,
+                    detail_low_mask,
                 )
 
         earring_supervision_dilate = int(self.losses_dict.get("earring_supervision_dilate", 5))
-        earring_supervision = dilate_mask(earring_confident_mask, earring_supervision_dilate) * query_mask
+        earring_supervision = torch.clamp(
+            dilate_mask(earring_detail_mask, earring_supervision_dilate)
+            + 0.18 * earring_confident_mask,
+            0,
+            1,
+        ) * query_mask
         weak_pseudo_mask = torch.zeros_like(earring_confident_mask)
-        if earring_confident_mask.detach().sum().item() < 1:
-            weak_pseudo_mask, _ = build_weak_ear_pseudo_mask(earring_reference, query_mask, earring_confident_mask)
-        mask_target = torch.clamp(weak_pseudo_mask + earring_supervision + earring_confident_mask, 0, 1)
-        query_expand = float(self.losses_dict.get("ear_query_expand", 0.02))
+        if earring_detail_mask.detach().sum().item() < 1:
+            weak_pseudo_mask, _ = build_weak_ear_pseudo_mask(earring_reference, query_mask, earring_detail_mask)
+        mask_target = torch.clamp(weak_pseudo_mask + earring_supervision + earring_detail_mask, 0, 1)
+        query_expand = float(self.losses_dict.get("ear_query_expand", 0.05))
         supervision_mask = torch.clamp(mask_target + query_expand * query_mask, 0, 1)
         if fine_mask is not None:
             supervision_mask = torch.clamp(supervision_mask + 0.5 * fine_mask.detach(), 0, 1)
@@ -474,12 +477,13 @@ class EarAwareLossBuilder(LossBuilderMulti):
 
         color_weight = self.losses_dict.get("ear_color", 0.0)
         if color_weight > 0:
+            color_mask = torch.clamp(earring_detail_mask + 0.35 * earring_highlight_mask, 0, 1) if earring_highlight_mask is not None else earring_detail_mask
             losses["ear_color"] = color_weight * (
-                masked_l1(gen_F_256_01, earring_reference, earring_confident_mask)
+                masked_l1(gen_F_256_01, earring_reference, color_mask)
                 + 0.5 * masked_l1(
                     low_pass_filter(gen_F_256_01),
                     low_pass_filter(earring_reference),
-                    earring_confident_mask,
+                    color_mask,
                 )
             )
 
@@ -505,14 +509,23 @@ class EarAwareLossBuilder(LossBuilderMulti):
             target_low = low_pass_filter(target)
             gen_low = low_pass_filter(gen_F_256_01)
             lighting_mask = torch.clamp(query_mask + (fine_mask if fine_mask is not None else 0), 0, 1)
-            lighting_mask = lighting_mask * (1.0 - earring_confident_mask).clamp(0, 1)
+            lighting_mask = lighting_mask * (1.0 - earring_detail_support).clamp(0, 1)
             losses["ear_lighting"] = lighting_weight * masked_l1(gen_low, target_low, lighting_mask)
+
+        non_ear_brightness_weight = self.losses_dict.get("ear_non_earring_brightness", 0.0)
+        if non_ear_brightness_weight > 0:
+            losses["ear_non_earring_brightness"] = non_ear_brightness_weight * masked_non_brighter(
+                rgb_to_gray(gen_F_256_01),
+                rgb_to_gray(target),
+                non_earring_ear_mask,
+                margin=float(self.losses_dict.get("ear_non_earring_brightness_margin", 0.025)),
+            )
 
         leak_weight = self.losses_dict.get("ear_hair_leak", 0.0)
         if leak_weight > 0 and source_hair_block_mask is not None:
             source_hair_block_mask = ensure_mask_4d(source_hair_block_mask).float()
             block_strength = max(0.0, min(1.0, float(self.losses_dict.get("ear_block_strength", 0.95))))
-            leak_mask = source_hair_block_mask * block_strength * (1.0 - earring_confident_mask).clamp(0, 1)
+            leak_mask = source_hair_block_mask * block_strength * (1.0 - earring_detail_support).clamp(0, 1)
             losses["ear_hair_leak"] = leak_weight * source_direction_leak_loss(
                 source,
                 target,

@@ -7,18 +7,14 @@ import typing as tp
 import numpy as np
 import torch
 import torchvision.transforms as T
-try:
-    import wandb
-except ImportError:
-    wandb = None
+import wandb
 from PIL import Image
 from joblib import Parallel, delayed
 from torch.utils.data import DataLoader, TensorDataset
-try:
-    from torchmetrics.image.fid import FrechetInceptionDistance
-except ImportError:
-    FrechetInceptionDistance = None
+from torchmetrics.image.fid import FrechetInceptionDistance
 from tqdm.auto import tqdm
+
+from models.Encoders_gpt2 import ClipModel
 
 
 def image_grid(imgs, rows, cols):
@@ -38,8 +34,6 @@ class WandbLogger:
         self.project = project
 
     def start_logging(self):
-        if wandb is None:
-            raise RuntimeError("Weights & Biases logging is enabled, but wandb is not installed.")
         wandb.login(key=os.environ['WANDB_KEY'].strip(), relogin=True)
         wandb.init(
             project=self.project,
@@ -66,9 +60,7 @@ class WandbLogger:
             self.wandb.save(new_path)
 
     def __del__(self):
-        logger = getattr(self, "wandb", None)
-        if logger is not None:
-            logger.finish()
+        self.wandb.finish()
 
 
 def toggle_grad(model, flag=True):
@@ -131,15 +123,10 @@ def parallel_load_images(paths, imgs):
 
 
 def get_fid_calc(instance='fid.pkl', dataset_path='', device=torch.device('cuda')):
-    if FrechetInceptionDistance is None and not os.path.isfile(instance):
-        raise RuntimeError("FID computation is enabled, but torchmetrics is not installed.")
-
     if os.path.isfile(instance):
         with open(instance, 'rb') as f:
             fid = pickle.load(f)
     else:
-        from models.Encoders import ClipModel
-
         fid = FrechetInceptionDistance(feature=ClipModel(), reset_real_features=False, normalize=True)
         fid.to(device).eval()
 

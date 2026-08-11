@@ -16,16 +16,16 @@ from utils.train import seed_everything
 # ========================= User Config: edit here only =========================
 USER_DATASET_PROFILE = "small"
 
-USER_FACE_ROOT_FFHQ = Path("images/FFHQ")
-USER_SHAPE_ROOT_FFHQ = Path("images/FFHQ")
-USER_COLOR_ROOT_FFHQ = Path("images/FFHQ")
+USER_FACE_ROOT_FFHQ = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FFHQ")
+USER_SHAPE_ROOT_FFHQ = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FFHQ")
+USER_COLOR_ROOT_FFHQ = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FFHQ")
 USER_OUTPUT_DIR_FFHQ = Path("input/blending_dataset_v8")
 USER_DATASET_SIZE_FFHQ = 3000
 
-USER_FACE_ROOT_SMALL = Path("images/FFHQ_long")
-USER_SHAPE_ROOT_SMALL = Path("images/FFHQ_short")
-USER_COLOR_ROOT_SMALL = Path("images/FFHQ_color")
-USER_OUTPUT_DIR_SMALL = Path("input/blending_dataset_v8_small")
+USER_FACE_ROOT_SMALL = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FFHQ_short")
+USER_SHAPE_ROOT_SMALL = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/long")
+USER_COLOR_ROOT_SMALL = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FFHQ_color")
+USER_OUTPUT_DIR_SMALL = Path("input/blending_dataset_v8_small_v2_short_to_long")
 USER_DATASET_SIZE_SMALL = 300
 
 USER_DEVICE = "cuda"
@@ -33,7 +33,7 @@ USER_RANDOM_SEED = 3407
 USER_ALLOW_REUSE_ACROSS_TRIPLETS = True
 
 USER_USE_SATD_V8 = True
-USER_SATD_CHECKPOINT_V8 = "output/satd_train_v8_3000/checkpoints/satd_for_infer_v8.pth"
+USER_SATD_CHECKPOINT_V8 = "/data/coding/HairFastGAN/HairFastGAN-main/best.pth"
 USER_SATD_BLEND_V8 = 0.34
 USER_SATD_BOUNDARY_V8 = 8
 USER_EQ8_REFERENCE_BLEND_V8 = 0.0
@@ -105,6 +105,10 @@ def build_remove_protect_mask(align_info: dict[str, object]) -> torch.Tensor:
         + 0.92 * delta_masks.get("M_remove_tail", zero).float()
         + 0.70 * delta_masks.get("M_face_strand_probe", zero).float()
         + 0.80 * delta_masks.get("M_remove_context", zero).float()
+        + 0.86 * delta_masks.get("M_body_preserve", zero).float()
+        + 0.72 * delta_masks.get("M_visible_body_anchor", zero).float()
+        + 0.60 * delta_masks.get("M_body_region", zero).float()
+        + 0.68 * delta_masks.get("M_cloth_region", zero).float()
         + 0.35 * delta_masks.get("M_boundary", zero).float()
     )
     return protect.clamp(0, 1)
@@ -276,8 +280,20 @@ def main():
             save_latents(ACTIVE_OUTPUT_DIR, "FS", fs_cache_name("color", color_name), latent_in=name_to_embed["color"]["S"])
             save_latents(ACTIVE_OUTPUT_DIR, "Align", align_cache_name(face_name, "shape", shape_name), latent_F=align_shape["latent_F_align"])
             save_latents(ACTIVE_OUTPUT_DIR, "Align", align_cache_name(face_name, "color", color_name), latent_F=align_color["latent_F_align"])
-            save_latents(ACTIVE_OUTPUT_DIR, "Masks", align_cache_name(face_name, "shape", shape_name), remove_mask=build_remove_protect_mask(align_shape))
-            save_latents(ACTIVE_OUTPUT_DIR, "Masks", align_cache_name(face_name, "color", color_name), remove_mask=build_remove_protect_mask(align_color))
+            save_latents(
+                ACTIVE_OUTPUT_DIR,
+                "Masks",
+                align_cache_name(face_name, "shape", shape_name),
+                remove_mask=build_remove_protect_mask(align_shape),
+                target_hair=align_shape["HM_X"].float(),
+            )
+            save_latents(
+                ACTIVE_OUTPUT_DIR,
+                "Masks",
+                align_cache_name(face_name, "color", color_name),
+                remove_mask=build_remove_protect_mask(align_color),
+                target_hair=align_color["HM_X"].float(),
+            )
 
     print(f"dataset profile: {USER_DATASET_PROFILE}")
     print(f"saved {len(triplets)} blending triplets to {ACTIVE_OUTPUT_DIR / 'dataset.exps'}")

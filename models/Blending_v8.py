@@ -2,7 +2,7 @@ import torch
 
 from models.Blending import Blending
 from models.Encoders import (
-    DIRECT_COLOR_ARCH_V8_2,
+    DIRECT_COLOR_ARCH_V8_3,
     DirectColorBlendAdapterV8,
     PostProcessModel,
     load_direct_color_adapter_state_v8,
@@ -28,28 +28,47 @@ class Blending_v8(Blending):
 
         checkpoint = torch.load(self.opts.blending_checkpoint, map_location=self.opts.device)
         checkpoint_arch = checkpoint.get("arch") if isinstance(checkpoint, dict) else None
-        if checkpoint_arch != DIRECT_COLOR_ARCH_V8_2:
+        if checkpoint_arch != DIRECT_COLOR_ARCH_V8_3:
             raise RuntimeError(
                 f"Refusing incompatible BlendingV8 checkpoint {self.opts.blending_checkpoint}: "
-                f"arch={checkpoint_arch!r}, required={DIRECT_COLOR_ARCH_V8_2!r}"
+                f"arch={checkpoint_arch!r}, required={DIRECT_COLOR_ARCH_V8_3!r}"
             )
         adapter_config = checkpoint.get("adapter_config", {})
         self.blending_encoder = DirectColorBlendAdapterV8(
             checkpoint.get("clip", "ViT-B/32"),
             direct_mix_init=adapter_config.get(
-                "direct_mix_init", getattr(self.opts, "direct_mix_init_v8", 0.65)
+                "direct_mix_init", getattr(self.opts, "direct_mix_init_v8", 0.70)
             ),
-            direct_mix_floor=adapter_config.get(
-                "direct_mix_floor", getattr(self.opts, "direct_mix_floor_v8", 0.20)
+            direct_mix_floor_low=adapter_config.get(
+                "direct_mix_floor_low", getattr(self.opts, "direct_mix_floor_low_v8", 0.10)
             ),
-            correction_budget_ratio=adapter_config.get(
-                "correction_budget_ratio", getattr(self.opts, "correction_budget_ratio_v8", 0.25)
+            direct_mix_floor_high=adapter_config.get(
+                "direct_mix_floor_high", getattr(self.opts, "direct_mix_floor_high_v8", 0.60)
+            ),
+            direct_mix_mode=adapter_config.get(
+                "direct_mix_mode", getattr(self.opts, "direct_mix_mode_v8", "learned_retained")
+            ),
+            direct_mix_fixed=adapter_config.get(
+                "direct_mix_fixed", getattr(self.opts, "direct_mix_fixed_v8", 0.70)
+            ),
+            correction_chroma_budget_ratio=adapter_config.get(
+                "correction_chroma_budget_ratio",
+                getattr(self.opts, "correction_chroma_budget_ratio_v8", 0.15),
+            ),
+            correction_luma_budget_ratio=adapter_config.get(
+                "correction_luma_budget_ratio",
+                getattr(self.opts, "correction_luma_budget_ratio_v8", 0.10),
+            ),
+            correction_orth_scale=adapter_config.get(
+                "correction_orth_scale", getattr(self.opts, "correction_orth_scale_v8", 0.25)
             ),
         )
         source_state = checkpoint.get("model_state_dict", checkpoint)
         report = load_direct_color_adapter_state_v8(self.blending_encoder, source_state)
+        self.blending_encoder.set_anchor_trainable(False)
+        self.blending_encoder.set_correction_trainable(False)
         print(
-            f"[Blending_v8] loaded arch={DIRECT_COLOR_ARCH_V8_2} "
+            f"[Blending_v8] loaded arch={DIRECT_COLOR_ARCH_V8_3} "
             f"strict adapter tensors={len(report['loaded'])}"
         )
         self.blending_encoder.to(self.opts.device).eval()
@@ -165,6 +184,15 @@ class Blending_v8(Blending):
                     layer_mix=blending_aux["layer_mix"],
                     correction_norm=blending_aux["correction_norm"],
                     correction_budget=blending_aux["correction_budget"],
+                    correction_chroma_budget=blending_aux["correction_chroma_budget"],
+                    correction_luma_budget=blending_aux["correction_luma_budget"],
+                    direct_parallel_correction_coeff=blending_aux[
+                        "direct_parallel_correction_coeff"
+                    ],
+                    negative_parallel_fraction=blending_aux[
+                        "negative_parallel_fraction"
+                    ],
+                    anchor_frozen=blending_aux["anchor_frozen"],
                     total_delta_norm=blending_aux["total_delta_norm"],
                 )
             save_gen_image(output_dir, "Final_v8", "final.png", I_final)

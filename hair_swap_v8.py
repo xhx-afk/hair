@@ -110,7 +110,7 @@ def get_parser_v8():
     parser.add_argument(
         "--blending_checkpoint",
         type=str,
-        default="output/blending_train_v8_direct_anchor_v2/checkpoints/best.pth",
+        default="output/blending_train_v8_direct_anchor_v2_1/checkpoints/best_balanced.pth",
     )
     parser.add_argument("--pp_checkpoint", type=str, default="pretrained_models/PostProcess/pp_model.pth")
     parser.add_argument("--use_satd_v8", action="store_true")
@@ -124,9 +124,18 @@ def get_parser_v8():
     parser.add_argument("--lightness-full-edit-threshold-v8", type=float, default=15.0)
     parser.add_argument("--max-global-l-shift-v8", type=float, default=20.0)
     parser.add_argument("--min-safe-reference-fraction-v8", type=float, default=0.35)
-    parser.add_argument("--direct-mix-init-v8", type=float, default=0.65)
-    parser.add_argument("--direct-mix-floor-v8", type=float, default=0.20)
-    parser.add_argument("--correction-budget-ratio-v8", type=float, default=0.25)
+    parser.add_argument("--direct-mix-init-v8", type=float, default=0.70)
+    parser.add_argument("--direct-mix-floor-low-v8", type=float, default=0.10)
+    parser.add_argument("--direct-mix-floor-high-v8", type=float, default=0.60)
+    parser.add_argument(
+        "--direct-mix-mode-v8",
+        choices=("fixed", "learned_retained"),
+        default="learned_retained",
+    )
+    parser.add_argument("--direct-mix-fixed-v8", type=float, default=0.70)
+    parser.add_argument("--correction-chroma-budget-ratio-v8", type=float, default=0.15)
+    parser.add_argument("--correction-luma-budget-ratio-v8", type=float, default=0.10)
+    parser.add_argument("--correction-orth-scale-v8", type=float, default=0.25)
     return parser
 
 

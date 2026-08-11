@@ -1,4 +1,4 @@
-"""Legacy test entry point retained for callers; exercises the V2 adapter only."""
+"""Legacy test entry point retained for callers; exercises the V8.3 adapter."""
 
 from test_v8_direct_color_adapter import main
 

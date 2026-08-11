@@ -23,7 +23,9 @@ USER_FACE_ROOT = Path("celeba-1024")
 USER_SHAPE_ROOT = Path("celeba-1024")
 USER_COLOR_ROOT = Path("celeba-1024")
 
-USER_BLENDING_CHECKPOINT = Path("output/blending_train_v8_direct_anchor_v2/checkpoints/best.pth")
+USER_BLENDING_CHECKPOINT = Path(
+    "output/blending_train_v8_direct_anchor_v2_1/checkpoints/best_balanced.pth"
+)
 USER_RUN_TAG = ""  # Empty means derive a tag from USER_BLENDING_CHECKPOINT.
 USER_OUTPUT_ROOT = Path("output/blending_fid_generate_v8")
 USER_MANIFEST_DIR = Path("input/blending_fid_samples_v8")
@@ -45,9 +47,14 @@ USER_LIGHTNESS_NO_EDIT_THRESHOLD_V8 = 3.0
 USER_LIGHTNESS_FULL_EDIT_THRESHOLD_V8 = 15.0
 USER_MAX_GLOBAL_L_SHIFT_V8 = 20.0
 USER_MIN_SAFE_REFERENCE_FRACTION_V8 = 0.35
-USER_DIRECT_MIX_INIT_V8 = 0.65
-USER_DIRECT_MIX_FLOOR_V8 = 0.20
-USER_CORRECTION_BUDGET_RATIO_V8 = 0.25
+USER_DIRECT_MIX_INIT_V8 = 0.70
+USER_DIRECT_MIX_FLOOR_LOW_V8 = 0.10
+USER_DIRECT_MIX_FLOOR_HIGH_V8 = 0.60
+USER_DIRECT_MIX_MODE_V8 = "learned_retained"
+USER_DIRECT_MIX_FIXED_V8 = 0.70
+USER_CORRECTION_CHROMA_BUDGET_RATIO_V8 = 0.15
+USER_CORRECTION_LUMA_BUDGET_RATIO_V8 = 0.10
+USER_CORRECTION_ORTH_SCALE_V8 = 0.25
 
 USER_EMPTY_CACHE_EVERY = 50
 # ============================================================================
@@ -69,7 +76,7 @@ from hair_swap_v8 import get_parser_v8
 from models.Alignment_v8 import Alignment_v8
 from models.Embedding import Embedding
 from models.Encoders import (
-    DIRECT_COLOR_ARCH_V8_2,
+    DIRECT_COLOR_ARCH_V8_3,
     DirectColorBlendAdapterV8,
     load_direct_color_adapter_state_v8,
 )
@@ -307,27 +314,47 @@ class BlendingStageV8:
 
         checkpoint = torch.load(model_args.blending_checkpoint, map_location=model_args.device)
         checkpoint_arch = checkpoint.get("arch") if isinstance(checkpoint, dict) else None
-        if checkpoint_arch != DIRECT_COLOR_ARCH_V8_2:
+        if checkpoint_arch != DIRECT_COLOR_ARCH_V8_3:
             raise RuntimeError(
                 f"Refusing incompatible BlendingV8 checkpoint {model_args.blending_checkpoint}: "
-                f"arch={checkpoint_arch!r}, required={DIRECT_COLOR_ARCH_V8_2!r}"
+                f"arch={checkpoint_arch!r}, required={DIRECT_COLOR_ARCH_V8_3!r}"
             )
         adapter_config = checkpoint.get("adapter_config", {})
         self.blending_encoder = DirectColorBlendAdapterV8(
             checkpoint.get("clip", "ViT-B/32"),
             direct_mix_init=adapter_config.get("direct_mix_init", model_args.direct_mix_init_v8),
-            direct_mix_floor=adapter_config.get("direct_mix_floor", model_args.direct_mix_floor_v8),
-            correction_budget_ratio=adapter_config.get(
-                "correction_budget_ratio", model_args.correction_budget_ratio_v8
+            direct_mix_floor_low=adapter_config.get(
+                "direct_mix_floor_low", model_args.direct_mix_floor_low_v8
+            ),
+            direct_mix_floor_high=adapter_config.get(
+                "direct_mix_floor_high", model_args.direct_mix_floor_high_v8
+            ),
+            direct_mix_mode=adapter_config.get(
+                "direct_mix_mode", model_args.direct_mix_mode_v8
+            ),
+            direct_mix_fixed=adapter_config.get(
+                "direct_mix_fixed", model_args.direct_mix_fixed_v8
+            ),
+            correction_chroma_budget_ratio=adapter_config.get(
+                "correction_chroma_budget_ratio",
+                model_args.correction_chroma_budget_ratio_v8,
+            ),
+            correction_luma_budget_ratio=adapter_config.get(
+                "correction_luma_budget_ratio", model_args.correction_luma_budget_ratio_v8
+            ),
+            correction_orth_scale=adapter_config.get(
+                "correction_orth_scale", model_args.correction_orth_scale_v8
             ),
         )
         report = load_direct_color_adapter_state_v8(
             self.blending_encoder,
             checkpoint["model_state_dict"],
         )
+        self.blending_encoder.set_anchor_trainable(False)
+        self.blending_encoder.set_correction_trainable(False)
         self.blending_encoder.to(model_args.device).eval()
         print(
-            f"[blending_fid_v8] loaded arch={DIRECT_COLOR_ARCH_V8_2} "
+            f"[blending_fid_v8] loaded arch={DIRECT_COLOR_ARCH_V8_3} "
             f"strict adapter tensors={len(report['loaded'])}",
             file=sys.stderr,
         )
@@ -443,8 +470,13 @@ def build_model() -> BlendingStageV8:
     model_args.max_global_l_shift_v8 = USER_MAX_GLOBAL_L_SHIFT_V8
     model_args.min_safe_reference_fraction_v8 = USER_MIN_SAFE_REFERENCE_FRACTION_V8
     model_args.direct_mix_init_v8 = USER_DIRECT_MIX_INIT_V8
-    model_args.direct_mix_floor_v8 = USER_DIRECT_MIX_FLOOR_V8
-    model_args.correction_budget_ratio_v8 = USER_CORRECTION_BUDGET_RATIO_V8
+    model_args.direct_mix_floor_low_v8 = USER_DIRECT_MIX_FLOOR_LOW_V8
+    model_args.direct_mix_floor_high_v8 = USER_DIRECT_MIX_FLOOR_HIGH_V8
+    model_args.direct_mix_mode_v8 = USER_DIRECT_MIX_MODE_V8
+    model_args.direct_mix_fixed_v8 = USER_DIRECT_MIX_FIXED_V8
+    model_args.correction_chroma_budget_ratio_v8 = USER_CORRECTION_CHROMA_BUDGET_RATIO_V8
+    model_args.correction_luma_budget_ratio_v8 = USER_CORRECTION_LUMA_BUDGET_RATIO_V8
+    model_args.correction_orth_scale_v8 = USER_CORRECTION_ORTH_SCALE_V8
     return BlendingStageV8(model_args)
 
 

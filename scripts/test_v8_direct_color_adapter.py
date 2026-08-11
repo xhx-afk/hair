@@ -81,9 +81,8 @@ def main():
     output_init, _ = run_model(
         model, latent_face, latent_color, descriptor, ones,
         correction_enabled=False,
-        layer_mix_override=0.65,
     )
-    expected_init = latent_face + 0.65 * (latent_color - latent_face)
+    expected_init = latent_face + 0.70 * (latent_color - latent_face)
     assert (output_init - expected_init).abs().max() < 1e-6, "Test C: initial direct mix formula mismatch"
 
     with torch.no_grad():

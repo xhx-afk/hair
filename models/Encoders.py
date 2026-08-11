@@ -104,11 +104,11 @@ class ClipBlendingModel(nn.Module):
         return output
 
 
-DIRECT_COLOR_ARCH_V8_2 = "direct_color_anchor_v8_2"
+DIRECT_COLOR_ARCH_V8_3 = "direct_color_anchor_v8_3"
 
 
 def load_direct_color_adapter_state_v8(module, state_dict):
-    """Strictly load every V2 adapter tensor except the frozen CLIP weights."""
+    """Strictly load every V8.3 adapter tensor except the frozen CLIP weights."""
     incompatible = module.load_state_dict(state_dict, strict=False)
     invalid_missing = [
         key for key in incompatible.missing_keys
@@ -116,7 +116,7 @@ def load_direct_color_adapter_state_v8(module, state_dict):
     ]
     if invalid_missing or incompatible.unexpected_keys:
         raise RuntimeError(
-            "Invalid direct_color_anchor_v8_2 state_dict: "
+            "Invalid direct_color_anchor_v8_3 state_dict: "
             f"missing_non_clip={invalid_missing}, "
             f"unexpected={list(incompatible.unexpected_keys)}"
         )
@@ -131,9 +131,14 @@ class DirectColorBlendAdapterV8(nn.Module):
         self,
         clip_model="ViT-B/32",
         descriptor_dim=COLOR_DESCRIPTOR_DIM,
-        direct_mix_init=0.65,
-        direct_mix_floor=0.20,
-        correction_budget_ratio=0.25,
+        direct_mix_init=0.70,
+        direct_mix_floor_low=0.10,
+        direct_mix_floor_high=0.60,
+        direct_mix_mode="learned_retained",
+        direct_mix_fixed=0.70,
+        correction_chroma_budget_ratio=0.15,
+        correction_luma_budget_ratio=0.10,
+        correction_orth_scale=0.25,
         clip_model_module=None,
         descriptor_hidden=128,
         correction_hidden=512,
@@ -159,7 +164,7 @@ class DirectColorBlendAdapterV8(nn.Module):
         )
         self.layer_mix_head = nn.Linear(descriptor_hidden, 12)
         self.layer_embedding = nn.Embedding(12, layer_embed_dim)
-        correction_input_dim = 512 + 512 + descriptor_hidden + layer_embed_dim
+        correction_input_dim = 512 + 512 + descriptor_hidden + layer_embed_dim + 3
         self.correction_mlp = nn.Sequential(
             nn.Linear(correction_input_dim, correction_hidden),
             nn.LayerNorm(correction_hidden),
@@ -171,13 +176,25 @@ class DirectColorBlendAdapterV8(nn.Module):
         )
         if not 0.0 < direct_mix_init < 1.0:
             raise ValueError("direct_mix_init must be strictly between 0 and 1")
-        if not 0.0 <= direct_mix_floor <= 1.0:
-            raise ValueError("direct_mix_floor must be in [0,1]")
-        if correction_budget_ratio < 0.0:
-            raise ValueError("correction_budget_ratio must be non-negative")
+        if not 0.0 <= direct_mix_floor_low <= direct_mix_floor_high <= 1.0:
+            raise ValueError("direct mix floors must satisfy 0 <= low <= high <= 1")
+        if direct_mix_mode not in {"fixed", "learned_retained"}:
+            raise ValueError("direct_mix_mode must be 'fixed' or 'learned_retained'")
+        if not 0.0 <= direct_mix_fixed <= 1.0:
+            raise ValueError("direct_mix_fixed must be in [0,1]")
+        if correction_chroma_budget_ratio < 0.0 or correction_luma_budget_ratio < 0.0:
+            raise ValueError("correction budget ratios must be non-negative")
+        if not 0.0 <= correction_orth_scale <= 1.0:
+            raise ValueError("correction_orth_scale must be in [0,1]")
         self.direct_mix_init = float(direct_mix_init)
-        self.direct_mix_floor = float(direct_mix_floor)
-        self.correction_budget_ratio = float(correction_budget_ratio)
+        self.direct_mix_floor_low = float(direct_mix_floor_low)
+        self.direct_mix_floor_high = float(direct_mix_floor_high)
+        self.direct_mix_mode = direct_mix_mode
+        self.direct_mix_fixed = float(direct_mix_fixed)
+        self.correction_chroma_budget_ratio = float(correction_chroma_budget_ratio)
+        self.correction_luma_budget_ratio = float(correction_luma_budget_ratio)
+        self.correction_orth_scale = float(correction_orth_scale)
+        self.anchor_frozen = False
 
         nn.init.zeros_(self.layer_mix_head.weight)
         init_logit = torch.logit(torch.tensor(self.direct_mix_init)).item()
@@ -204,6 +221,20 @@ class DirectColorBlendAdapterV8(nn.Module):
         for module in (self.layer_embedding, self.correction_mlp):
             for parameter in module.parameters():
                 parameter.requires_grad = bool(enabled)
+
+    def set_anchor_trainable(self, enabled):
+        for module in (self.descriptor_encoder, self.layer_mix_head):
+            for parameter in module.parameters():
+                parameter.requires_grad = bool(enabled)
+        self.anchor_frozen = not bool(enabled)
+
+    def anchor_parameters(self):
+        for module in (self.descriptor_encoder, self.layer_mix_head):
+            yield from module.parameters()
+
+    def correction_parameters(self):
+        for module in (self.layer_embedding, self.correction_mlp):
+            yield from module.parameters()
 
     @staticmethod
     def _layer_mix_override(value, batch, device, dtype):
@@ -253,14 +284,19 @@ class DirectColorBlendAdapterV8(nn.Module):
             raise ValueError("color_descriptor contains NaN or Inf")
         descriptor_feature = self.descriptor_encoder(color_descriptor.float()).to(latent_face.dtype)
         learned_mix = torch.sigmoid(self.layer_mix_head(descriptor_feature)).unsqueeze(-1)
-        mix_floor = self.direct_mix_floor * edit_gate
-        layer_mix = mix_floor + (1.0 - mix_floor) * learned_mix
+        dynamic_floor = self.direct_mix_floor_low + chroma_gate * (
+            self.direct_mix_floor_high - self.direct_mix_floor_low
+        )
+        if self.direct_mix_mode == "fixed":
+            layer_mix = learned_mix * 0.0 + self.direct_mix_fixed
+        else:
+            layer_mix = torch.maximum(learned_mix, dynamic_floor)
         if layer_mix_override is not None:
             layer_mix = self._layer_mix_override(
                 layer_mix_override, batch, latent_face.device, latent_face.dtype
             )
         direct_delta = latent_color - latent_face
-        direct_component = edit_gate * layer_mix * direct_delta
+        direct_component = chroma_gate * layer_mix * direct_delta
 
         if correction_enabled:
             source_normalized = self.pixelnorm(latent_face)
@@ -268,8 +304,9 @@ class DirectColorBlendAdapterV8(nn.Module):
             descriptor_layers = descriptor_feature[:, None, :].expand(-1, 12, -1)
             layer_indices = torch.arange(12, device=latent_face.device)
             layer_feature = self.layer_embedding(layer_indices)[None].expand(batch, -1, -1)
+            gate_features = torch.cat((chroma_gate, lightness_gate, edit_gate), dim=2).expand(-1, 12, -1)
             correction_input = torch.cat(
-                (source_normalized, delta_normalized, descriptor_layers, layer_feature),
+                (source_normalized, delta_normalized, descriptor_layers, layer_feature, gate_features),
                 dim=-1,
             )
             raw_correction = self.correction_mlp(correction_input)
@@ -279,14 +316,38 @@ class DirectColorBlendAdapterV8(nn.Module):
         direct_delta_norm = torch.linalg.vector_norm(direct_delta.flatten(1), dim=1)
         direct_component_norm = torch.linalg.vector_norm(direct_component.flatten(1), dim=1)
         correction_raw_norm = torch.linalg.vector_norm(raw_correction.flatten(1), dim=1)
-        correction_budget = self.correction_budget_ratio * direct_component_norm.detach()
-        requested_correction_scale = correction_budget / (correction_raw_norm + 1e-6)
+        direct_flat = direct_component.flatten(1)
+        correction_flat = raw_correction.flatten(1)
+        direct_parallel_correction_coeff = (
+            (correction_flat * direct_flat).sum(dim=1)
+            / direct_flat.square().sum(dim=1).clamp_min(1e-6)
+        )
+        parallel_correction = direct_parallel_correction_coeff[:, None, None] * direct_component
+        orthogonal_correction = raw_correction - parallel_correction
+        positive_parallel_correction = (
+            torch.relu(direct_parallel_correction_coeff)[:, None, None] * direct_component
+        )
+        color_safe_correction = (
+            positive_parallel_correction
+            + self.correction_orth_scale * orthogonal_correction
+        )
+        color_safe_correction_norm = torch.linalg.vector_norm(
+            color_safe_correction.flatten(1), dim=1
+        )
+        chroma_budget = self.correction_chroma_budget_ratio * direct_component_norm.detach()
+        luma_budget = (
+            self.correction_luma_budget_ratio
+            * lightness_gate.flatten()
+            * direct_delta_norm.detach()
+        )
+        correction_budget = chroma_budget + luma_budget
+        requested_correction_scale = correction_budget / (color_safe_correction_norm + 1e-6)
         correction_budget_scale = torch.where(
             requested_correction_scale < 1.0,
             requested_correction_scale * (1.0 - 1e-5),
             torch.ones_like(requested_correction_scale),
         )
-        correction = raw_correction * correction_budget_scale[:, None, None]
+        correction = color_safe_correction * correction_budget_scale[:, None, None]
         output = latent_face + direct_component + edit_gate * correction
 
         assert direct_delta.shape == (batch, 12, 512)
@@ -309,8 +370,11 @@ class DirectColorBlendAdapterV8(nn.Module):
             "direct_delta_norm": direct_delta_norm,
             "direct_component_norm": direct_component_norm,
             "correction_raw_norm": correction_raw_norm,
+            "correction_color_safe_norm": color_safe_correction_norm,
             "correction_norm": correction_norm,
             "correction_budget": correction_budget,
+            "correction_chroma_budget": chroma_budget,
+            "correction_luma_budget": luma_budget,
             "correction_budget_scale": correction_budget_scale,
             "layer_mix": layer_mix,
             "layer_mix_mean": layer_mix.mean(dim=(1, 2)),
@@ -319,6 +383,13 @@ class DirectColorBlendAdapterV8(nn.Module):
             "chroma_need_gate": chroma_gate.flatten(),
             "lightness_need_gate": lightness_gate.flatten(),
             "edit_need_gate": edit_gate.flatten(),
+            "chroma_gate": chroma_gate.flatten(),
+            "lightness_gate": lightness_gate.flatten(),
+            "direct_parallel_correction_coeff": direct_parallel_correction_coeff,
+            "negative_parallel_fraction": (direct_parallel_correction_coeff < 0).float(),
+            "anchor_frozen": torch.full(
+                (batch,), self.anchor_frozen, device=latent_face.device, dtype=torch.bool
+            ),
             "direct_mix_fraction": direct_component_norm / direct_delta_norm.clamp_min(1e-6),
             "correction_to_direct_ratio": correction_norm / direct_component_norm.clamp_min(1e-6),
             "total_delta_norm": total_delta_norm,

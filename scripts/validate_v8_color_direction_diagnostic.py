@@ -10,11 +10,11 @@ from sklearn.model_selection import train_test_split
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import scripts.blending_train_v8 as train_v8
-from models.Encoders import DIRECT_COLOR_ARCH_V8_2, load_direct_color_adapter_state_v8
+from models.Encoders import DIRECT_COLOR_ARCH_V8_3, load_direct_color_adapter_state_v8
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run one direct-color-anchor V2 regression sample")
+    parser = argparse.ArgumentParser(description="Run one direct-color-anchor V8.3 regression sample")
     parser.add_argument("--val-index", type=int, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--dataset-dir", type=Path, default=train_v8.ACTIVE_DATASET_DIR)
@@ -32,28 +32,41 @@ def create_untrained_model(device: torch.device):
     return train_v8.BlendingModel(
         train_v8.USER_CLIP_MODEL,
         direct_mix_init=train_v8.USER_DIRECT_MIX_INIT,
-        direct_mix_floor=train_v8.USER_DIRECT_MIX_FLOOR,
-        correction_budget_ratio=train_v8.USER_CORRECTION_BUDGET_RATIO,
+        direct_mix_floor_low=train_v8.USER_DIRECT_MIX_FLOOR_LOW,
+        direct_mix_floor_high=train_v8.USER_DIRECT_MIX_FLOOR_HIGH,
+        direct_mix_mode=train_v8.USER_DIRECT_MIX_MODE,
+        direct_mix_fixed=train_v8.USER_DIRECT_MIX_FIXED,
+        correction_chroma_budget_ratio=train_v8.USER_CORRECTION_CHROMA_BUDGET_RATIO,
+        correction_luma_budget_ratio=train_v8.USER_CORRECTION_LUMA_BUDGET_RATIO,
+        correction_orth_scale=train_v8.USER_CORRECTION_ORTH_SCALE,
     ).to(device).eval()
 
 
-def load_v2_checkpoint(model: torch.nn.Module, checkpoint_path: Path, device: torch.device) -> None:
+def load_v3_checkpoint(model: torch.nn.Module, checkpoint_path: Path, device: torch.device) -> None:
     checkpoint = torch.load(checkpoint_path, map_location=device)
     checkpoint_arch = checkpoint.get("arch") if isinstance(checkpoint, dict) else None
-    if checkpoint_arch != DIRECT_COLOR_ARCH_V8_2:
+    if checkpoint_arch != DIRECT_COLOR_ARCH_V8_3:
         raise RuntimeError(
             f"Refusing incompatible checkpoint {checkpoint_path}: "
-            f"arch={checkpoint_arch!r}, required={DIRECT_COLOR_ARCH_V8_2!r}"
+            f"arch={checkpoint_arch!r}, required={DIRECT_COLOR_ARCH_V8_3!r}"
         )
     adapter_config = checkpoint.get("adapter_config", {})
     model.direct_mix_init = float(adapter_config.get("direct_mix_init", model.direct_mix_init))
-    model.direct_mix_floor = float(adapter_config.get("direct_mix_floor", model.direct_mix_floor))
-    model.correction_budget_ratio = float(
-        adapter_config.get("correction_budget_ratio", model.correction_budget_ratio)
-    )
+    for key in (
+        "direct_mix_floor_low",
+        "direct_mix_floor_high",
+        "direct_mix_fixed",
+        "correction_chroma_budget_ratio",
+        "correction_luma_budget_ratio",
+        "correction_orth_scale",
+    ):
+        setattr(model, key, float(adapter_config.get(key, getattr(model, key))))
+    model.direct_mix_mode = adapter_config.get("direct_mix_mode", model.direct_mix_mode)
     report = load_direct_color_adapter_state_v8(model, checkpoint["model_state_dict"])
+    model.set_anchor_trainable(False)
+    model.set_correction_trainable(False)
     print(
-        f"[v8_direct_diagnostic] loaded arch={DIRECT_COLOR_ARCH_V8_2} "
+        f"[v8_direct_diagnostic] loaded arch={DIRECT_COLOR_ARCH_V8_3} "
         f"strict adapter tensors={len(report['loaded'])}",
         file=sys.stderr,
     )
@@ -61,7 +74,9 @@ def load_v2_checkpoint(model: torch.nn.Module, checkpoint_path: Path, device: to
 
 def create_trainer(model: torch.nn.Module, device: torch.device):
     helper = train_v8.MaskPrepHelper(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=train_v8.USER_LR_STAGE_A)
+    model.set_anchor_trainable(True)
+    model.set_correction_trainable(False)
+    optimizer = torch.optim.Adam(list(model.anchor_parameters()), lr=train_v8.USER_LR_STAGE_A)
     trainer = train_v8.BlendingTrainerV8(model, optimizer, [], [], helper)
     return trainer, helper
 
@@ -129,14 +144,16 @@ def run_case(
         correction_enabled=False,
         layer_mix_override=1.0,
     )
-    initial_direct_tail, _ = trainer.run_adapter(
+    fixed_direct_tail, _ = trainer.run_adapter(
         prepared,
         correction_enabled=False,
-        layer_mix_override=model.direct_mix_init,
+        layer_mix_override=model.direct_mix_fixed,
     )
+    anchor_tail, anchor_aux = trainer.run_adapter(prepared, correction_enabled=False)
     generated_256 = render_tail(trainer, prepared, blend_tail)
     full_direct_256 = render_tail(trainer, prepared, full_direct_tail)
-    initial_direct_256 = render_tail(trainer, prepared, initial_direct_tail)
+    fixed_direct_256 = render_tail(trainer, prepared, fixed_direct_tail)
+    anchor_256 = render_tail(trainer, prepared, anchor_tail)
 
     generated_lab = train_v8.rgb_to_lab(generated_256)
     pseudo_lab = prepared["pseudo_lab"]
@@ -190,6 +207,10 @@ def run_case(
         "correction_to_direct_ratio",
         "total_delta_norm",
         "total_to_direct_ratio",
+        "direct_parallel_correction_coeff",
+        "negative_parallel_fraction",
+        "correction_chroma_budget",
+        "correction_luma_budget",
     ):
         metrics[key] = scalar(encoder_aux[key])
 
@@ -213,7 +234,15 @@ def run_case(
     )
     train_v8.save_preview(
         case_dir / "direct_diagnostic.png",
-        [prepared["base_i"], full_direct_256, initial_direct_256, generated_256],
+        [
+            prepared["base_i"],
+            prepared["color_i"],
+            full_direct_256,
+            fixed_direct_256,
+            anchor_256,
+            generated_256,
+            prepared["pseudo_rgb"],
+        ],
     )
     with open(case_dir / "metrics.json", "w", encoding="utf-8") as handle:
         json.dump(metrics, handle, ensure_ascii=False, indent=2)
@@ -227,7 +256,7 @@ def main():
         raise FileNotFoundError(f"Cannot find checkpoint: {args.checkpoint}")
     device = torch.device(train_v8.USER_DEVICE if torch.cuda.is_available() else "cpu")
     model = create_untrained_model(device)
-    load_v2_checkpoint(model, args.checkpoint, device)
+    load_v3_checkpoint(model, args.checkpoint, device)
     trainer, _ = create_trainer(model, device)
     metrics = run_case(
         model=model,

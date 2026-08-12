@@ -24,7 +24,7 @@ USER_SHAPE_ROOT = Path("celeba-1024")
 USER_COLOR_ROOT = Path("celeba-1024")
 
 USER_BLENDING_CHECKPOINT = Path(
-    "output/blending_train_v8_direct_anchor_v2_1/checkpoints/best_balanced.pth"
+    "output/blending_train_v8_direct_anchor_v2_2/checkpoints/best_balanced.pth"
 )
 USER_RUN_TAG = ""  # Empty means derive a tag from USER_BLENDING_CHECKPOINT.
 USER_OUTPUT_ROOT = Path("output/blending_fid_generate_v8")
@@ -41,17 +41,23 @@ USER_SATD_CHECKPOINT_V8 = "output/satd_train_v8_3000/checkpoints/satd_for_infer_
 USER_SATD_BLEND_V8 = 0.34
 USER_SATD_BOUNDARY_V8 = 8
 USER_EQ8_REFERENCE_BLEND_V8 = 0.0
-USER_CHROMA_NO_EDIT_THRESHOLD_V8 = 3.0
-USER_CHROMA_FULL_EDIT_THRESHOLD_V8 = 19.0
+USER_AB_NO_EDIT_THRESHOLD_V8 = 1.5
+USER_AB_FULL_EDIT_THRESHOLD_V8 = 15.0
+USER_HUE_NO_EDIT_DEG_V8 = 4.0
+USER_HUE_FULL_EDIT_DEG_V8 = 30.0
+USER_CHROMA_MAG_NO_EDIT_V8 = 2.0
+USER_CHROMA_MAG_FULL_EDIT_V8 = 15.0
+USER_COLOR_DIST_NO_EDIT_V8 = 2.0
+USER_COLOR_DIST_FULL_EDIT_V8 = 15.0
 USER_LIGHTNESS_NO_EDIT_THRESHOLD_V8 = 3.0
 USER_LIGHTNESS_FULL_EDIT_THRESHOLD_V8 = 15.0
-USER_MAX_GLOBAL_L_SHIFT_V8 = 20.0
+USER_MAX_GLOBAL_L_SHIFT_V8 = 40.0
+USER_RELATIVE_LUMA_BINS_V8 = 8
+USER_RELATIVE_LUMA_MIN_SCALE_V8 = 3.0
+USER_GLOBAL_AB_FALLBACK_MIN_RELIABILITY_V8 = 0.5
 USER_MIN_SAFE_REFERENCE_FRACTION_V8 = 0.35
-USER_DIRECT_MIX_INIT_V8 = 0.70
-USER_DIRECT_MIX_FLOOR_LOW_V8 = 0.10
-USER_DIRECT_MIX_FLOOR_HIGH_V8 = 0.60
-USER_DIRECT_MIX_MODE_V8 = "learned_retained"
-USER_DIRECT_MIX_FIXED_V8 = 0.70
+USER_ALPHA_INIT_V8 = 0.70
+USER_LAYER_OFFSET_MAX_V8 = 0.15
 USER_CORRECTION_CHROMA_BUDGET_RATIO_V8 = 0.15
 USER_CORRECTION_LUMA_BUDGET_RATIO_V8 = 0.10
 USER_CORRECTION_ORTH_SCALE_V8 = 0.25
@@ -76,7 +82,7 @@ from hair_swap_v8 import get_parser_v8
 from models.Alignment_v8 import Alignment_v8
 from models.Embedding import Embedding
 from models.Encoders import (
-    DIRECT_COLOR_ARCH_V8_3,
+    DIRECT_COLOR_ARCH_V8_4,
     DirectColorBlendAdapterV8,
     load_direct_color_adapter_state_v8,
 )
@@ -304,36 +310,38 @@ class BlendingStageV8:
         self.dilate_erosion = DilateErosion(dilate_erosion=model_args.smooth, device=model_args.device)
         self.downsample_256 = BicubicDownSample(factor=4)
         self.color_config = ColorConditionConfigV8(
-            chroma_no_edit_threshold=model_args.chroma_no_edit_threshold_v8,
-            chroma_full_edit_threshold=model_args.chroma_full_edit_threshold_v8,
+            ab_no_edit_threshold=model_args.ab_no_edit_threshold_v8,
+            ab_full_edit_threshold=model_args.ab_full_edit_threshold_v8,
+            hue_no_edit_deg=model_args.hue_no_edit_deg_v8,
+            hue_full_edit_deg=model_args.hue_full_edit_deg_v8,
+            chroma_mag_no_edit=model_args.chroma_mag_no_edit_v8,
+            chroma_mag_full_edit=model_args.chroma_mag_full_edit_v8,
+            color_dist_no_edit=model_args.color_dist_no_edit_v8,
+            color_dist_full_edit=model_args.color_dist_full_edit_v8,
             lightness_no_edit_threshold=model_args.lightness_no_edit_threshold_v8,
             lightness_full_edit_threshold=model_args.lightness_full_edit_threshold_v8,
             max_global_l_shift=model_args.max_global_l_shift_v8,
+            relative_luma_bins=model_args.relative_luma_bins_v8,
+            relative_luma_min_scale=model_args.relative_luma_min_scale_v8,
+            global_ab_fallback_min_reliability=(
+                model_args.global_ab_fallback_min_reliability_v8
+            ),
             min_safe_fraction=model_args.min_safe_reference_fraction_v8,
         )
 
         checkpoint = torch.load(model_args.blending_checkpoint, map_location=model_args.device)
         checkpoint_arch = checkpoint.get("arch") if isinstance(checkpoint, dict) else None
-        if checkpoint_arch != DIRECT_COLOR_ARCH_V8_3:
+        if checkpoint_arch != DIRECT_COLOR_ARCH_V8_4:
             raise RuntimeError(
                 f"Refusing incompatible BlendingV8 checkpoint {model_args.blending_checkpoint}: "
-                f"arch={checkpoint_arch!r}, required={DIRECT_COLOR_ARCH_V8_3!r}"
+                f"arch={checkpoint_arch!r}, required={DIRECT_COLOR_ARCH_V8_4!r}"
             )
         adapter_config = checkpoint.get("adapter_config", {})
         self.blending_encoder = DirectColorBlendAdapterV8(
             checkpoint.get("clip", "ViT-B/32"),
-            direct_mix_init=adapter_config.get("direct_mix_init", model_args.direct_mix_init_v8),
-            direct_mix_floor_low=adapter_config.get(
-                "direct_mix_floor_low", model_args.direct_mix_floor_low_v8
-            ),
-            direct_mix_floor_high=adapter_config.get(
-                "direct_mix_floor_high", model_args.direct_mix_floor_high_v8
-            ),
-            direct_mix_mode=adapter_config.get(
-                "direct_mix_mode", model_args.direct_mix_mode_v8
-            ),
-            direct_mix_fixed=adapter_config.get(
-                "direct_mix_fixed", model_args.direct_mix_fixed_v8
+            alpha_init=adapter_config.get("alpha_init", model_args.alpha_init_v8),
+            layer_offset_max=adapter_config.get(
+                "layer_offset_max", model_args.layer_offset_max_v8
             ),
             correction_chroma_budget_ratio=adapter_config.get(
                 "correction_chroma_budget_ratio",
@@ -354,7 +362,7 @@ class BlendingStageV8:
         self.blending_encoder.set_correction_trainable(False)
         self.blending_encoder.to(model_args.device).eval()
         print(
-            f"[blending_fid_v8] loaded arch={DIRECT_COLOR_ARCH_V8_3} "
+            f"[blending_fid_v8] loaded arch={DIRECT_COLOR_ARCH_V8_4} "
             f"strict adapter tensors={len(report['loaded'])}",
             file=sys.stderr,
         )
@@ -463,17 +471,25 @@ def build_model() -> BlendingStageV8:
     model_args.satd_blend_v8 = USER_SATD_BLEND_V8
     model_args.satd_boundary_v8 = USER_SATD_BOUNDARY_V8
     model_args.eq8_reference_blend_v8 = USER_EQ8_REFERENCE_BLEND_V8
-    model_args.chroma_no_edit_threshold_v8 = USER_CHROMA_NO_EDIT_THRESHOLD_V8
-    model_args.chroma_full_edit_threshold_v8 = USER_CHROMA_FULL_EDIT_THRESHOLD_V8
+    model_args.ab_no_edit_threshold_v8 = USER_AB_NO_EDIT_THRESHOLD_V8
+    model_args.ab_full_edit_threshold_v8 = USER_AB_FULL_EDIT_THRESHOLD_V8
+    model_args.hue_no_edit_deg_v8 = USER_HUE_NO_EDIT_DEG_V8
+    model_args.hue_full_edit_deg_v8 = USER_HUE_FULL_EDIT_DEG_V8
+    model_args.chroma_mag_no_edit_v8 = USER_CHROMA_MAG_NO_EDIT_V8
+    model_args.chroma_mag_full_edit_v8 = USER_CHROMA_MAG_FULL_EDIT_V8
+    model_args.color_dist_no_edit_v8 = USER_COLOR_DIST_NO_EDIT_V8
+    model_args.color_dist_full_edit_v8 = USER_COLOR_DIST_FULL_EDIT_V8
     model_args.lightness_no_edit_threshold_v8 = USER_LIGHTNESS_NO_EDIT_THRESHOLD_V8
     model_args.lightness_full_edit_threshold_v8 = USER_LIGHTNESS_FULL_EDIT_THRESHOLD_V8
     model_args.max_global_l_shift_v8 = USER_MAX_GLOBAL_L_SHIFT_V8
+    model_args.relative_luma_bins_v8 = USER_RELATIVE_LUMA_BINS_V8
+    model_args.relative_luma_min_scale_v8 = USER_RELATIVE_LUMA_MIN_SCALE_V8
+    model_args.global_ab_fallback_min_reliability_v8 = (
+        USER_GLOBAL_AB_FALLBACK_MIN_RELIABILITY_V8
+    )
     model_args.min_safe_reference_fraction_v8 = USER_MIN_SAFE_REFERENCE_FRACTION_V8
-    model_args.direct_mix_init_v8 = USER_DIRECT_MIX_INIT_V8
-    model_args.direct_mix_floor_low_v8 = USER_DIRECT_MIX_FLOOR_LOW_V8
-    model_args.direct_mix_floor_high_v8 = USER_DIRECT_MIX_FLOOR_HIGH_V8
-    model_args.direct_mix_mode_v8 = USER_DIRECT_MIX_MODE_V8
-    model_args.direct_mix_fixed_v8 = USER_DIRECT_MIX_FIXED_V8
+    model_args.alpha_init_v8 = USER_ALPHA_INIT_V8
+    model_args.layer_offset_max_v8 = USER_LAYER_OFFSET_MAX_V8
     model_args.correction_chroma_budget_ratio_v8 = USER_CORRECTION_CHROMA_BUDGET_RATIO_V8
     model_args.correction_luma_budget_ratio_v8 = USER_CORRECTION_LUMA_BUDGET_RATIO_V8
     model_args.correction_orth_scale_v8 = USER_CORRECTION_ORTH_SCALE_V8

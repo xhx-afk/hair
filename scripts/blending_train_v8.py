@@ -24,13 +24,22 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from hair_swap_v8 import HairFast_v8, get_parser_v8
 from models.Encoders import (
-    DIRECT_COLOR_ARCH_V8_3,
+    DIRECT_COLOR_ARCH_V8_4,
     DirectColorBlendAdapterV8 as BlendingModel,
     load_direct_color_adapter_state_v8,
 )
 from models.Net import Net
 from models.SG_IDCT_v16 import gaussian_blur2d, rgb_to_lab
-from models.color_condition_v8 import ColorConditionConfigV8, build_color_condition_bundle
+from models.color_condition_v8 import (
+    ColorConditionConfigV8,
+    build_color_condition_bundle,
+    compute_intrinsic_hair_color_stats,
+    compute_reference_fidelity_metrics,
+    correction_hue_regression_loss,
+    correction_reference_regression_loss,
+    reference_color_score,
+)
+from models.direct_strength_teacher_v8 import load_teacher_cache, triplet_cache_key
 from models.face_parsing.model import BiSeNet, seg_mean, seg_std
 from utils.bicubic import BicubicDownSample
 from utils.image_utils import DilateErosion
@@ -63,14 +72,14 @@ USER_DATASET_DIR_FFHQ = Path("input/blending_dataset_v8")
 USER_FACE_ROOT_FFHQ = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FFHQ")
 USER_SHAPE_ROOT_FFHQ = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FFHQ")
 USER_COLOR_ROOT_FFHQ = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FFHQ")
-USER_OUTPUT_DIR_FFHQ = Path("output/blending_train_v8_direct_anchor_v2_1")
+USER_OUTPUT_DIR_FFHQ = Path("output/blending_train_v8_direct_anchor_v2_2")
 USER_VAL_SIZE_FFHQ = 512
 
 USER_DATASET_DIR_SMALL = Path("input/blending_dataset_v8_small_v2_short_to_long")
 USER_FACE_ROOT_SMALL = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FFHQ_short")
 USER_SHAPE_ROOT_SMALL = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/long")
 USER_COLOR_ROOT_SMALL = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FFHQ_color")
-USER_OUTPUT_DIR_SMALL = Path("output/blending_train_v8_direct_anchor_v2_1_small")
+USER_OUTPUT_DIR_SMALL = Path("output/blending_train_v8_direct_anchor_v2_2_small")
 USER_VAL_SIZE_SMALL = 64
 
 USER_DEVICE = "cuda"
@@ -107,34 +116,53 @@ USER_TARGET_HAIR_NECK_OVERRIDE = 0.94
 USER_AUTHOR_COLOR_ALIGN_BATCH_PROB = 0.0
 USER_AUTHOR_ZERO_PREFIX_TRAIN = True
 
-USER_CHROMA_NO_EDIT_THRESHOLD_V8 = 3.0
-USER_CHROMA_FULL_EDIT_THRESHOLD_V8 = 19.0
+USER_AB_NO_EDIT = 1.5
+USER_AB_FULL_EDIT = 15.0
+USER_HUE_NO_EDIT_DEG = 4.0
+USER_HUE_FULL_EDIT_DEG = 30.0
+USER_CHROMA_MAG_NO_EDIT = 2.0
+USER_CHROMA_MAG_FULL_EDIT = 15.0
+USER_COLOR_DIST_NO_EDIT = 2.0
+USER_COLOR_DIST_FULL_EDIT = 15.0
 USER_LIGHTNESS_NO_EDIT_THRESHOLD_V8 = 3.0
 USER_LIGHTNESS_FULL_EDIT_THRESHOLD_V8 = 15.0
-USER_MAX_GLOBAL_L_SHIFT_V8 = 20.0
+USER_MAX_GLOBAL_L_SHIFT_V8 = 40.0
+USER_RELATIVE_LUMA_BINS = 8
+USER_RELATIVE_LUMA_MIN_SCALE = 3.0
+USER_GLOBAL_AB_FALLBACK_MIN_RELIABILITY = 0.5
 USER_MIN_SAFE_REFERENCE_FRACTION_V8 = 0.35
 USER_HIGHLIGHT_MAD_SCALE = 1.8
 USER_HIGHLIGHT_GLOBAL_MIN_MARGIN = 3.0
 USER_HIGHLIGHT_LOCAL_L_MARGIN = 2.5
 USER_HIGHLIGHT_LOCAL_C_MARGIN = 1.5
 USER_HIGHLIGHT_CHROMA_RATIO = 0.82
-USER_DIRECT_MIX_MODE = "learned_retained"
-USER_DIRECT_MIX_INIT = 0.70
-USER_DIRECT_MIX_FLOOR_LOW = 0.10
-USER_DIRECT_MIX_FLOOR_HIGH = 0.60
-USER_DIRECT_MIX_FIXED = 0.70
-USER_DIRECT_MIX_TARGET_LOW = 0.40
-USER_DIRECT_MIX_TARGET_HIGH = 0.68
-USER_DIRECT_MIX_RETENTION_WEIGHT = 2.0
+USER_ALPHA_INIT = 0.70
+USER_LAYER_OFFSET_MAX = 0.15
+USER_TEACHER_ALPHA_CANDIDATES = [0.0, 0.25, 0.50, 0.70, 0.85, 1.0]
+USER_ALPHA_TEACHER_LOSS_WEIGHT = 5.0
+USER_TEACHER_MARGIN_SCALE = 1.0
+USER_TEACHER_CACHE_NAME = "teacher_direct_strength_v8_4.pt"
+USER_REQUIRE_TEACHER_CACHE = True
+USER_REF_MEAN_AB_LOSS_WEIGHT = 8.0
+USER_REF_HUE_LOSS_WEIGHT = 2.0
+USER_REF_CHROMA_LOSS_WEIGHT = 3.0
 USER_CORRECTION_CHROMA_BUDGET_RATIO = 0.15
 USER_CORRECTION_LUMA_BUDGET_RATIO = 0.10
 USER_CORRECTION_ORTH_SCALE = 0.25
 USER_CORRECTION_COLOR_TOLERANCE = 0.5
 USER_CORRECTION_COLOR_REGRESSION_WEIGHT = 2.0
+USER_CORRECTION_HUE_TOLERANCE_DEG = 1.5
+USER_CORRECTION_HUE_REGRESSION_WEIGHT = 2.0
+USER_CORRECTION_REF_SCORE_TOLERANCE = 0.2
+USER_CORRECTION_REF_REGRESSION_WEIGHT = 2.0
 USER_CORRECTION_REGRESSION_BATCH_PROB = 1.0
 USER_HIGH_CHROMA_THRESHOLD = 0.90
-USER_MIN_HIGH_CHROMA_MIX = 0.60
 USER_COLOR_REGRESSION_LIMIT = 0.15
+USER_ALPHA_COLLAPSE_STD = 0.05
+USER_TEACHER_DIVERSE_STD = 0.10
+USER_PSEUDO_FIDELITY_BAD_FRACTION = 0.10
+USER_FIXED_REGRESSION_INDICES = (0, 1, 4, 14, 23)
+USER_DIAGNOSTIC_ALPHA = 0.70
 USER_CLIP_MODEL = "ViT-B/32"
 USER_USE_SATD_V8 = True
 USER_SATD_CHECKPOINT_V8 = "/data/coding/HairFastGAN/HairFastGAN-main/best.pth"
@@ -171,9 +199,14 @@ STAGE_A_LOSS_WEIGHTS = {
     "protect_chroma": 2.0,
     "skin_chroma": 4.0,
     "skin_rgb": 2.0,
-    "mix_retention": 2.0,
+    "alpha_teacher": USER_ALPHA_TEACHER_LOSS_WEIGHT,
+    "ref_mean_ab": USER_REF_MEAN_AB_LOSS_WEIGHT,
+    "ref_hue": USER_REF_HUE_LOSS_WEIGHT,
+    "ref_chroma": USER_REF_CHROMA_LOSS_WEIGHT,
     "correction_norm": 0.0,
     "correction_color_regression": 0.0,
+    "correction_hue_regression": 0.0,
+    "correction_ref_regression": 0.0,
 }
 
 STAGE_B_LOSS_WEIGHTS = {
@@ -188,9 +221,14 @@ STAGE_B_LOSS_WEIGHTS = {
     "protect_chroma": USER_PROTECT_CHROMA_KEEP_LOSS_WEIGHT,
     "skin_chroma": USER_SKIN_CHROMA_KEEP_LOSS_WEIGHT,
     "skin_rgb": USER_SKIN_RGB_KEEP_LOSS_WEIGHT,
-    "mix_retention": USER_DIRECT_MIX_RETENTION_WEIGHT,
+    "alpha_teacher": 0.0,
+    "ref_mean_ab": USER_REF_MEAN_AB_LOSS_WEIGHT,
+    "ref_hue": USER_REF_HUE_LOSS_WEIGHT,
+    "ref_chroma": USER_REF_CHROMA_LOSS_WEIGHT,
     "correction_norm": USER_CORRECTION_NORM_WEIGHT,
     "correction_color_regression": USER_CORRECTION_COLOR_REGRESSION_WEIGHT,
+    "correction_hue_regression": USER_CORRECTION_HUE_REGRESSION_WEIGHT,
+    "correction_ref_regression": USER_CORRECTION_REF_REGRESSION_WEIGHT,
 }
 
 
@@ -659,6 +697,7 @@ class BlendingDatasetV8(Dataset):
         dataset_dir: Path,
         face_root: Path,
         color_root: Path,
+        teacher_records: dict[str, dict[str, float]] | None = None,
     ):
         super().__init__()
         base_exps = [(p1, p2, p3) for (p1, p2, p3) in exps]
@@ -669,6 +708,17 @@ class BlendingDatasetV8(Dataset):
         self.dataset_dir = dataset_dir
         self.face_root = face_root
         self.color_root = color_root
+        self.teacher_records = teacher_records
+        if teacher_records is not None:
+            missing = [
+                triplet_cache_key(exp) for exp in self.exps
+                if triplet_cache_key(exp) not in teacher_records
+            ]
+            if missing:
+                raise RuntimeError(
+                    f"V8.4 teacher cache is missing {len(missing)} dataset triplets; "
+                    f"first missing key={missing[0]}"
+                )
         print(f"dataset pairs: {len(self.exps)}", file=sys.stderr)
 
     def __len__(self):
@@ -678,7 +728,11 @@ class BlendingDatasetV8(Dataset):
         item = prepare_item(self.exps[idx], self.dataset_dir, self.face_root, self.color_root)
         if item is None:
             raise RuntimeError(f"Failed to prepare blending item at index {idx}")
-        return item
+        sample_key = triplet_cache_key(self.exps[idx])
+        record = self.teacher_records.get(sample_key) if self.teacher_records is not None else None
+        teacher_alpha = float("nan") if record is None else float(record["teacher_alpha"])
+        teacher_confidence = 0.0 if record is None else float(record["teacher_confidence"])
+        return (*item, sample_key, teacher_alpha, teacher_confidence)
 
 
 class BlendingTrainerV8:
@@ -695,17 +749,24 @@ class BlendingTrainerV8:
         self.optimizer = optimizer
         self.current_stage: str | None = None
         self.stage_b_anchor_snapshot: dict[str, torch.Tensor] | None = None
-        self.stage_b_start_layer_mix: float | None = None
-        self.collapse_reference: dict[str, float] | None = None
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.helper = helper
         self.color_config = ColorConditionConfigV8(
-            chroma_no_edit_threshold=USER_CHROMA_NO_EDIT_THRESHOLD_V8,
-            chroma_full_edit_threshold=USER_CHROMA_FULL_EDIT_THRESHOLD_V8,
+            ab_no_edit_threshold=USER_AB_NO_EDIT,
+            ab_full_edit_threshold=USER_AB_FULL_EDIT,
+            hue_no_edit_deg=USER_HUE_NO_EDIT_DEG,
+            hue_full_edit_deg=USER_HUE_FULL_EDIT_DEG,
+            chroma_mag_no_edit=USER_CHROMA_MAG_NO_EDIT,
+            chroma_mag_full_edit=USER_CHROMA_MAG_FULL_EDIT,
+            color_dist_no_edit=USER_COLOR_DIST_NO_EDIT,
+            color_dist_full_edit=USER_COLOR_DIST_FULL_EDIT,
             lightness_no_edit_threshold=USER_LIGHTNESS_NO_EDIT_THRESHOLD_V8,
             lightness_full_edit_threshold=USER_LIGHTNESS_FULL_EDIT_THRESHOLD_V8,
             max_global_l_shift=USER_MAX_GLOBAL_L_SHIFT_V8,
+            relative_luma_bins=USER_RELATIVE_LUMA_BINS,
+            relative_luma_min_scale=USER_RELATIVE_LUMA_MIN_SCALE,
+            global_ab_fallback_min_reliability=USER_GLOBAL_AB_FALLBACK_MIN_RELIABILITY,
             min_safe_fraction=USER_MIN_SAFE_REFERENCE_FRACTION_V8,
             highlight_mad_scale=USER_HIGHLIGHT_MAD_SCALE,
             highlight_global_min_margin=USER_HIGHLIGHT_GLOBAL_MIN_MARGIN,
@@ -717,7 +778,7 @@ class BlendingTrainerV8:
         self.best_color_score = float("inf")
         self.best_balanced_score = float("inf")
         self.stage_a_best_color_score = float("inf")
-        self.best_high_chroma_ab_error = float("inf")
+        self.best_high_color_reference_score = float("inf")
         self.output_ckpt_dir = ACTIVE_OUTPUT_DIR / "checkpoints"
         self.output_val_dir = ACTIVE_OUTPUT_DIR / "val_images"
         self.output_ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -744,10 +805,11 @@ class BlendingTrainerV8:
         )
 
     def _snapshot_anchor(self) -> dict[str, torch.Tensor]:
+        anchor_prefixes = ("descriptor_encoder.", "strength_head.", "layer_offset_head.")
         return {
             key: value.detach().cpu().clone()
             for key, value in self.model.state_dict().items()
-            if key.startswith("descriptor_encoder.") or key.startswith("layer_mix_head.")
+            if key.startswith(anchor_prefixes)
         }
 
     def anchor_max_abs_change(self) -> float:
@@ -766,16 +828,14 @@ class BlendingTrainerV8:
                 f"Stage B requires the best Stage A anchor checkpoint, but {path} does not exist"
             )
         checkpoint = torch.load(path, map_location=self.device)
-        if checkpoint.get("arch") != DIRECT_COLOR_ARCH_V8_3:
+        if checkpoint.get("arch") != DIRECT_COLOR_ARCH_V8_4:
             raise RuntimeError(f"Incompatible Stage A anchor checkpoint: {path}")
         source_state = checkpoint["model_state_dict"]
-        stage_a_summary = checkpoint.get("validation_summary", {})
-        if "high_chroma_mean_mix" in stage_a_summary:
-            self.stage_b_start_layer_mix = float(stage_a_summary["high_chroma_mean_mix"])
         current_state = self.model.state_dict()
+        anchor_prefixes = ("descriptor_encoder.", "strength_head.", "layer_offset_head.")
         anchor_keys = [
             key for key in current_state
-            if key.startswith("descriptor_encoder.") or key.startswith("layer_mix_head.")
+            if key.startswith(anchor_prefixes)
         ]
         missing = [key for key in anchor_keys if key not in source_state]
         if missing:
@@ -797,6 +857,9 @@ class BlendingTrainerV8:
             target_hair_color,
             color_i,
             face_i,
+            sample_ids,
+            teacher_alpha,
+            teacher_confidence,
         ) = batch
         del align_f_color, remove_mask_color, target_hair_color
         align_f = align_f_shape
@@ -806,6 +869,8 @@ class BlendingTrainerV8:
             item.to(self.device, non_blocking=True)
             for item in (color_s, align_s, align_f, remove_mask, target_hair, color_i, face_i)
         ]
+        teacher_alpha = teacher_alpha.to(self.device, non_blocking=True).float()
+        teacher_confidence = teacher_confidence.to(self.device, non_blocking=True).float()
         remove_mask = remove_mask.float().clamp(0, 1)
         if remove_mask.dim() == 3:
             remove_mask = remove_mask.unsqueeze(1)
@@ -938,6 +1003,8 @@ class BlendingTrainerV8:
         if not valid.any():
             return None
 
+        valid_indices = valid.nonzero(as_tuple=False).flatten().tolist()
+
         return {
             "color_s": color_s[valid],
             "align_s": align_s[valid],
@@ -961,6 +1028,15 @@ class BlendingTrainerV8:
             "pseudo_lab": condition_bundle["pseudo_lab"][valid],
             "pseudo_rgb": condition_bundle["pseudo_rgb"][valid],
             "color_proxy": condition_bundle["color_proxy"][valid],
+            "ref_stats": {
+                key: value[valid] for key, value in condition_bundle["ref_stats"].items()
+            },
+            "base_stats": {
+                key: value[valid] for key, value in condition_bundle["base_stats"].items()
+            },
+            "teacher_alpha": teacher_alpha[valid],
+            "teacher_confidence": teacher_confidence[valid],
+            "sample_id": [sample_ids[index] for index in valid_indices],
             "condition_metrics": {
                 key: value[valid]
                 for key, value in condition_bundle["metrics"].items()
@@ -1048,6 +1124,42 @@ class BlendingTrainerV8:
         base_luma = base_lab[:, 0:1]
         gen_chroma = gen_lab[:, 1:3]
         base_chroma = base_lab[:, 1:3]
+        gen_stats = compute_intrinsic_hair_color_stats(
+            gen_lab, mask_gen_hair, self.color_config
+        )
+        ref_stats = prepared["ref_stats"]
+        final_ref_metrics = compute_reference_fidelity_metrics(
+            gen_lab, mask_gen_hair, ref_stats, self.color_config
+        )
+        final_ref_score_per_sample = reference_color_score(final_ref_metrics)
+        encoder_aux["reference_color_score"] = final_ref_score_per_sample.detach()
+
+        teacher_confidence = prepared["teacher_confidence"].clamp(0, 1)
+        alpha_teacher_per_sample = tnf.smooth_l1_loss(
+            encoder_aux["predicted_alpha"],
+            prepared["teacher_alpha"],
+            reduction="none",
+        )
+        alpha_teacher_loss = (
+            alpha_teacher_per_sample * teacher_confidence
+        ).sum() / teacher_confidence.sum().clamp_min(1.0)
+        ref_mean_ab_loss = tnf.l1_loss(
+            gen_stats["mean_ab"] / 110.0,
+            ref_stats["mean_ab"] / 110.0,
+        )
+        ref_hue_loss = (
+            (
+                1.0
+                - (gen_stats["hue_unit"] * ref_stats["hue_unit"])
+                .sum(dim=1)
+                .clamp(-1, 1)
+            )
+            * ref_stats["hue_validity"]
+        ).mean()
+        ref_chroma_loss = tnf.l1_loss(
+            gen_stats["median_chroma"] / 110.0,
+            ref_stats["median_chroma"] / 110.0,
+        )
 
         pseudo_ab_loss_per_sample = self.masked_l1_per_sample(
             gen_chroma / 110.0,
@@ -1087,13 +1199,6 @@ class BlendingTrainerV8:
             skin_protect_mask,
         )
         skin_rgb_keep_loss = self.masked_l1(i_gen, i_base, skin_protect_mask)
-        target_mix = USER_DIRECT_MIX_TARGET_LOW + prepared["chroma_need_gate"] * (
-            USER_DIRECT_MIX_TARGET_HIGH - USER_DIRECT_MIX_TARGET_LOW
-        )
-        mix_retention_loss = (
-            prepared["chroma_need_gate"]
-            * torch.relu(target_mix - encoder_aux["layer_mix_mean"]).square()
-        ).mean()
         correction_norm_loss = (
             encoder_aux["correction_norm"]
             / encoder_aux["direct_delta_norm"].clamp_min(1.0)
@@ -1104,8 +1209,11 @@ class BlendingTrainerV8:
         )
         if anchor_i is None:
             correction_color_regression_loss = i_gen.sum() * 0.0
+            correction_hue_regression = i_gen.sum() * 0.0
+            correction_ref_regression = i_gen.sum() * 0.0
         else:
-            anchor_chroma = rgb_to_lab(anchor_i)[:, 1:3]
+            anchor_lab = rgb_to_lab(anchor_i)
+            anchor_chroma = anchor_lab[:, 1:3]
             anchor_ab_error_per_sample = self.masked_mean_per_sample(
                 torch.linalg.vector_norm(
                     anchor_chroma - pseudo_lab[:, 1:3], dim=1, keepdim=True
@@ -1117,6 +1225,19 @@ class BlendingTrainerV8:
                 - anchor_ab_error_per_sample
                 - USER_CORRECTION_COLOR_TOLERANCE
             ).mean()
+            anchor_ref_metrics = compute_reference_fidelity_metrics(
+                anchor_lab, mask_gen_hair, ref_stats, self.color_config
+            )
+            correction_hue_regression = correction_hue_regression_loss(
+                anchor_ref_metrics["hue_error"],
+                final_ref_metrics["hue_error"],
+                USER_CORRECTION_HUE_TOLERANCE_DEG,
+            )
+            correction_ref_regression = correction_reference_regression_loss(
+                anchor_ref_metrics,
+                final_ref_metrics,
+                USER_CORRECTION_REF_SCORE_TOLERANCE,
+            )
 
         weights = STAGE_A_LOSS_WEIGHTS if stage == "A" else STAGE_B_LOSS_WEIGHTS
 
@@ -1132,9 +1253,14 @@ class BlendingTrainerV8:
             + weights["protect_chroma"] * protect_chroma_keep_loss
             + weights["skin_chroma"] * skin_chroma_keep_loss
             + weights["skin_rgb"] * skin_rgb_keep_loss
-            + weights["mix_retention"] * mix_retention_loss
+            + weights["alpha_teacher"] * alpha_teacher_loss
+            + weights["ref_mean_ab"] * ref_mean_ab_loss
+            + weights["ref_hue"] * ref_hue_loss
+            + weights["ref_chroma"] * ref_chroma_loss
             + weights["correction_norm"] * correction_norm_loss
             + weights["correction_color_regression"] * correction_color_regression_loss
+            + weights["correction_hue_regression"] * correction_hue_regression
+            + weights["correction_ref_regression"] * correction_ref_regression
         )
         return total_loss, {
             "face_loss": face_loss,
@@ -1149,9 +1275,22 @@ class BlendingTrainerV8:
             "protect_chroma_keep": protect_chroma_keep_loss,
             "skin_chroma_keep": skin_chroma_keep_loss,
             "skin_rgb_keep": skin_rgb_keep_loss,
-            "mix_retention": mix_retention_loss,
+            "alpha_teacher": alpha_teacher_loss,
+            "ref_mean_ab": ref_mean_ab_loss,
+            "ref_hue": ref_hue_loss,
+            "ref_chroma": ref_chroma_loss,
             "correction_norm": correction_norm_loss,
             "correction_color_regression": correction_color_regression_loss,
+            "correction_hue_regression": correction_hue_regression,
+            "correction_ref_regression": correction_ref_regression,
+            "final_to_reference_ab": final_ref_metrics["mean_ab_error"].mean(),
+            "final_to_reference_hue": final_ref_metrics["hue_error"].mean(),
+            "final_to_reference_chroma": final_ref_metrics["chroma_error"].mean(),
+            "reference_color_score": final_ref_score_per_sample.mean(),
+            "teacher_alpha_mae": (
+                (encoder_aux["predicted_alpha"] - prepared["teacher_alpha"]).abs()
+                * teacher_confidence
+            ).sum() / teacher_confidence.sum().clamp_min(1.0),
             "result_to_pseudo_ab_l2": final_ab_error_per_sample.mean(),
             "result_hue_error": self.masked_mean_value(
                 torch.rad2deg(
@@ -1185,23 +1324,18 @@ class BlendingTrainerV8:
         saved_state_dict = {key: value for key, value in model_state_dict.items() if not key.startswith("clip_model.")}
         torch.save(
             {
-                "arch": DIRECT_COLOR_ARCH_V8_3,
+                "arch": DIRECT_COLOR_ARCH_V8_4,
                 "epoch": epoch,
                 "stage": self.current_stage,
                 "best_color_score": self.best_color_score,
                 "best_balanced_score": self.best_balanced_score,
                 "stage_a_best_color_score": self.stage_a_best_color_score,
-                "best_high_chroma_ab_error": self.best_high_chroma_ab_error,
-                "stage_b_start_layer_mix": self.stage_b_start_layer_mix,
-                "collapse_reference": self.collapse_reference,
+                "best_high_color_reference_score": self.best_high_color_reference_score,
                 "validation_summary": validation_summary or {},
                 "clip": USER_CLIP_MODEL,
                 "adapter_config": {
-                    "direct_mix_init": USER_DIRECT_MIX_INIT,
-                    "direct_mix_floor_low": USER_DIRECT_MIX_FLOOR_LOW,
-                    "direct_mix_floor_high": USER_DIRECT_MIX_FLOOR_HIGH,
-                    "direct_mix_mode": USER_DIRECT_MIX_MODE,
-                    "direct_mix_fixed": USER_DIRECT_MIX_FIXED,
+                    "alpha_init": USER_ALPHA_INIT,
+                    "layer_offset_max": USER_LAYER_OFFSET_MAX,
                     "correction_chroma_budget_ratio": USER_CORRECTION_CHROMA_BUDGET_RATIO,
                     "correction_luma_budget_ratio": USER_CORRECTION_LUMA_BUDGET_RATIO,
                     "correction_orth_scale": USER_CORRECTION_ORTH_SCALE,
@@ -1222,18 +1356,15 @@ class BlendingTrainerV8:
 
         checkpoint = torch.load(resume_path, map_location=self.device)
         checkpoint_arch = checkpoint.get("arch") if isinstance(checkpoint, dict) else None
-        if checkpoint_arch != DIRECT_COLOR_ARCH_V8_3:
+        if checkpoint_arch != DIRECT_COLOR_ARCH_V8_4:
             raise RuntimeError(
                 f"Refusing to resume incompatible BlendingV8 checkpoint {resume_path}: "
-                f"arch={checkpoint_arch!r}, required={DIRECT_COLOR_ARCH_V8_3!r}"
+                f"arch={checkpoint_arch!r}, required={DIRECT_COLOR_ARCH_V8_4!r}"
             )
         adapter_config = checkpoint.get("adapter_config", {})
         expected_adapter_config = {
-            "direct_mix_init": self.model.direct_mix_init,
-            "direct_mix_floor_low": self.model.direct_mix_floor_low,
-            "direct_mix_floor_high": self.model.direct_mix_floor_high,
-            "direct_mix_mode": self.model.direct_mix_mode,
-            "direct_mix_fixed": self.model.direct_mix_fixed,
+            "alpha_init": self.model.alpha_init,
+            "layer_offset_max": self.model.layer_offset_max,
             "correction_chroma_budget_ratio": self.model.correction_chroma_budget_ratio,
             "correction_luma_budget_ratio": self.model.correction_luma_budget_ratio,
             "correction_orth_scale": self.model.correction_orth_scale,
@@ -1245,7 +1376,7 @@ class BlendingTrainerV8:
         }
         if mismatched_config:
             raise RuntimeError(
-                f"Resume adapter_config does not match current V8.3 config: {mismatched_config}"
+                f"Resume adapter_config does not match current V8.4 config: {mismatched_config}"
             )
         state_dict = checkpoint.get("model_state_dict", checkpoint)
         report = load_direct_color_adapter_state_v8(self.model, state_dict)
@@ -1258,14 +1389,11 @@ class BlendingTrainerV8:
         self.stage_a_best_color_score = float(
             checkpoint.get("stage_a_best_color_score", self.stage_a_best_color_score)
         )
-        self.best_high_chroma_ab_error = float(
-            checkpoint.get("best_high_chroma_ab_error", self.best_high_chroma_ab_error)
+        self.best_high_color_reference_score = float(
+            checkpoint.get(
+                "best_high_color_reference_score", self.best_high_color_reference_score
+            )
         )
-        saved_start_mix = checkpoint.get("stage_b_start_layer_mix")
-        self.stage_b_start_layer_mix = (
-            None if saved_start_mix is None else float(saved_start_mix)
-        )
-        self.collapse_reference = checkpoint.get("collapse_reference")
         next_epoch = min(start_epoch, USER_EPOCHS - 1)
         if checkpoint.get("stage") == "A" and next_epoch >= USER_STAGE_A_EPOCHS:
             self.current_stage = "A"
@@ -1277,7 +1405,7 @@ class BlendingTrainerV8:
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         print(
             f"[blending_v8] resumed from {resume_path} "
-            f"with {len(report['loaded'])} strict V8.3 adapter tensors; "
+            f"with {len(report['loaded'])} strict V8.4 adapter tensors; "
             f"start_epoch={start_epoch + 1} stage={next_stage}",
             file=sys.stderr,
         )
@@ -1334,6 +1462,7 @@ class BlendingTrainerV8:
             edit_need_gate=prepared["edit_need_gate"],
             correction_enabled=correction_enabled,
             layer_mix_override=layer_mix_override,
+            teacher_alpha=prepared["teacher_alpha"],
             return_aux=True,
         )
 
@@ -1415,16 +1544,21 @@ class BlendingTrainerV8:
                 "loss_pseudo_luma": loss_info["pseudo_luma"],
                 "loss_positive_luma": loss_info["positive_luma"],
                 "loss_hf_luma": loss_info["hf_luma"],
-                "loss_mix_retention": loss_info["mix_retention"],
+                "loss_alpha_teacher": loss_info["alpha_teacher"],
+                "loss_ref_mean_ab": loss_info["ref_mean_ab"],
+                "loss_ref_hue": loss_info["ref_hue"],
+                "loss_ref_chroma": loss_info["ref_chroma"],
                 "loss_correction_norm": loss_info["correction_norm"],
                 "loss_correction_color_regression": loss_info["correction_color_regression"],
+                "loss_correction_hue_regression": loss_info["correction_hue_regression"],
+                "loss_correction_ref_regression": loss_info["correction_ref_regression"],
                 "mean_chroma_need_gate": prepared["chroma_need_gate"].mean(),
                 "mean_lightness_need_gate": prepared["lightness_need_gate"].mean(),
                 "mean_edit_need_gate": prepared["edit_need_gate"].mean(),
                 "mean_safe_fraction": prepared["condition_metrics"]["safe_fraction"].mean(),
                 "mean_direct_component_norm": encoder_aux["direct_component_norm"].mean(),
                 "mean_correction_norm": encoder_aux["correction_norm"].mean(),
-                "mean_layer_mix": encoder_aux["layer_mix_mean"].mean(),
+                "mean_predicted_alpha": encoder_aux["predicted_alpha"].mean(),
                 "mean_negative_parallel_fraction": encoder_aux[
                     "negative_parallel_fraction"
                 ].mean(),
@@ -1524,7 +1658,7 @@ class BlendingTrainerV8:
             fixed_s, fixed_aux = self.run_adapter(
                 prepared,
                 correction_enabled=False,
-                layer_mix_override=USER_DIRECT_MIX_FIXED,
+                layer_mix_override=USER_DIAGNOSTIC_ALPHA,
             )
             fixed_i_256 = self.render_blend_tail(prepared, fixed_s)
             loss, loss_info = self.calc_loss(
@@ -1562,13 +1696,37 @@ class BlendingTrainerV8:
             generated_lab = rgb_to_lab(i_g_256)
             anchor_lab = rgb_to_lab(anchor_i_256)
             fixed_lab = rgb_to_lab(fixed_i_256)
+            final_ref_metrics = compute_reference_fidelity_metrics(
+                generated_lab,
+                prepared["color_transfer_mask"],
+                prepared["ref_stats"],
+                self.color_config,
+            )
+            anchor_ref_metrics = compute_reference_fidelity_metrics(
+                anchor_lab,
+                prepared["color_transfer_mask"],
+                prepared["ref_stats"],
+                self.color_config,
+            )
             luma_excess = generated_lab[:, 0:1] - prepared["pseudo_lab"][:, 0:1]
             if len(preview_rows) < USER_LOG_IMAGE_COUNT:
+                zero_direct_s, _ = self.run_adapter(
+                    prepared,
+                    correction_enabled=False,
+                    layer_mix_override=0.0,
+                )
+                half_direct_s, _ = self.run_adapter(
+                    prepared,
+                    correction_enabled=False,
+                    layer_mix_override=0.5,
+                )
                 full_direct_s, _ = self.run_adapter(
                     prepared,
                     correction_enabled=False,
                     layer_mix_override=1.0,
                 )
+                zero_direct_i = self.render_blend_tail(prepared, zero_direct_s)
+                half_direct_i = self.render_blend_tail(prepared, half_direct_s)
                 full_direct_i = self.render_blend_tail(prepared, full_direct_s)
                 for idx in range(bsz):
                     excess_preview = (
@@ -1589,11 +1747,13 @@ class BlendingTrainerV8:
                     direct_preview_rows.append([
                         prepared["base_i"][idx : idx + 1],
                         prepared["color_i"][idx : idx + 1],
-                        full_direct_i[idx : idx + 1],
+                        prepared["pseudo_rgb"][idx : idx + 1],
+                        zero_direct_i[idx : idx + 1],
+                        half_direct_i[idx : idx + 1],
                         fixed_i_256[idx : idx + 1],
+                        full_direct_i[idx : idx + 1],
                         anchor_i_256[idx : idx + 1],
                         i_g_256[idx : idx + 1],
-                        prepared["pseudo_rgb"][idx : idx + 1],
                     ])
                     if len(preview_rows) >= USER_LOG_IMAGE_COUNT:
                         break
@@ -1626,8 +1786,16 @@ class BlendingTrainerV8:
                     ).clamp_min(1e-4)
                 ).clamp(-1, 1)
                 sample_excess = luma_excess[idx : idx + 1]
+                predicted_alpha = float(encoder_aux["predicted_alpha"][idx].item())
+                teacher_alpha = float(prepared["teacher_alpha"][idx].item())
+                final_ref_score = float(reference_color_score({
+                    key: value[idx : idx + 1]
+                    for key, value in final_ref_metrics.items()
+                    if key != "candidate_stats"
+                }).item())
                 validation_records.append({
                     "sample_index": len(validation_records),
+                    "sample_id": prepared["sample_id"][idx],
                     "ref_base_ab_distance": float(
                         prepared["condition_metrics"]["ref_base_ab_distance"][idx].item()
                     ),
@@ -1639,6 +1807,59 @@ class BlendingTrainerV8:
                     "rejected_fraction": float(
                         prepared["condition_metrics"]["rejected_fraction"][idx].item()
                     ),
+                    "composite_color_distance": float(
+                        prepared["condition_metrics"]["composite_color_distance"][idx].item()
+                    ),
+                    "hue_distance_deg": float(
+                        prepared["condition_metrics"]["hue_distance_deg"][idx].item()
+                    ),
+                    "chroma_distance": float(
+                        prepared["condition_metrics"]["chroma_distance"][idx].item()
+                    ),
+                    "distribution_distance": float(
+                        prepared["condition_metrics"]["distribution_distance"][idx].item()
+                    ),
+                    "relative_luma_reliability": float(
+                        prepared["condition_metrics"]["relative_luma_reliability"][idx].item()
+                    ),
+                    "pseudo_reference_fidelity": float(
+                        prepared["condition_metrics"]["pseudo_reference_fidelity"][idx].item()
+                    ),
+                    "pseudo_to_reference_ab_error": float(
+                        prepared["condition_metrics"]["pseudo_to_reference_mean_ab"][idx].item()
+                    ),
+                    "pseudo_to_reference_hue_error": float(
+                        prepared["condition_metrics"]["pseudo_to_reference_hue_error"][idx].item()
+                    ),
+                    "pseudo_to_reference_chroma_error": float(
+                        prepared["condition_metrics"]["pseudo_to_reference_chroma_error"][idx].item()
+                    ),
+                    "pseudo_to_reference_l_error": float(
+                        prepared["condition_metrics"]["pseudo_to_reference_median_l_error"][idx].item()
+                    ),
+                    "anchor_to_reference_ab_error": float(
+                        anchor_ref_metrics["mean_ab_error"][idx].item()
+                    ),
+                    "anchor_to_reference_hue_error": float(
+                        anchor_ref_metrics["hue_error"][idx].item()
+                    ),
+                    "anchor_to_reference_chroma_error": float(
+                        anchor_ref_metrics["chroma_error"][idx].item()
+                    ),
+                    "final_to_reference_ab_error": float(
+                        final_ref_metrics["mean_ab_error"][idx].item()
+                    ),
+                    "final_to_reference_hue_error": float(
+                        final_ref_metrics["hue_error"][idx].item()
+                    ),
+                    "final_to_reference_chroma_error": float(
+                        final_ref_metrics["chroma_error"][idx].item()
+                    ),
+                    "final_reference_color_score": final_ref_score,
+                    "teacher_alpha": teacher_alpha,
+                    "teacher_confidence": float(prepared["teacher_confidence"][idx].item()),
+                    "predicted_alpha": predicted_alpha,
+                    "alpha_abs_error": abs(predicted_alpha - teacher_alpha),
                     "result_to_pseudo_ab_l2": float(self.masked_mean_value(
                         torch.linalg.vector_norm(sample_gen_ab - sample_pseudo_ab, dim=1, keepdim=True),
                         sample_mask,
@@ -1735,40 +1956,67 @@ class BlendingTrainerV8:
         def record_mean(records: list[dict[str, object]], key: str) -> float:
             return sum(float(record[key]) for record in records) / len(records)
 
-        high_chroma_ab_error = record_mean(
-            high_chroma_records, "final_result_to_pseudo_ab_l2"
+        mean_pseudo_to_ref_ab = record_mean(
+            validation_records, "pseudo_to_reference_ab_error"
         )
-        high_chroma_hue_error = record_mean(high_chroma_records, "final_hue_error")
-        high_chroma_mean_mix = record_mean(high_chroma_records, "final_layer_mix")
-        anchor_high_chroma_ab_error = record_mean(
-            high_chroma_records, "anchor_result_to_pseudo_ab_l2"
+        mean_pseudo_to_ref_hue = record_mean(
+            validation_records, "pseudo_to_reference_hue_error"
         )
-        anchor_high_chroma_hue_error = record_mean(
-            high_chroma_records, "anchor_hue_error"
+        mean_final_to_ref_ab = record_mean(
+            validation_records, "final_to_reference_ab_error"
         )
-        fixed_high_chroma_ab_error = record_mean(
-            high_chroma_records, "fixed_result_to_pseudo_ab_l2"
+        mean_final_to_ref_hue = record_mean(
+            validation_records, "final_to_reference_hue_error"
         )
-        fixed_high_chroma_hue_error = record_mean(
-            high_chroma_records, "fixed_hue_error"
+        mean_final_to_ref_chroma = record_mean(
+            validation_records, "final_to_reference_chroma_error"
         )
+        high_color_final_to_ref_ab = record_mean(
+            high_chroma_records, "final_to_reference_ab_error"
+        )
+        high_color_final_to_ref_hue = record_mean(
+            high_chroma_records, "final_to_reference_hue_error"
+        )
+        high_color_final_to_ref_chroma = record_mean(
+            high_chroma_records, "final_to_reference_chroma_error"
+        )
+        predicted_alphas = np.asarray(
+            [record["predicted_alpha"] for record in validation_records], dtype=np.float64
+        )
+        teacher_alphas = np.asarray(
+            [record["teacher_alpha"] for record in validation_records], dtype=np.float64
+        )
+        predicted_alpha_mean = float(predicted_alphas.mean())
+        predicted_alpha_std = float(predicted_alphas.std())
+        teacher_alpha_std = float(teacher_alphas.std())
+        teacher_alpha_mae = float(
+            np.mean(np.abs(predicted_alphas - teacher_alphas))
+        )
+        pseudo_failure_records = [
+            record for record in validation_records
+            if record["pseudo_to_reference_ab_error"] > 8.0
+            or record["pseudo_to_reference_hue_error"] > 15.0
+        ]
+        pseudo_failure_fraction = len(pseudo_failure_records) / len(validation_records)
         artifact_penalty = 20.0 * max(0.0, avg_losses["frac_l_excess_gt12"] - 0.15)
-        color_score = high_chroma_ab_error + 0.10 * high_chroma_hue_error
+        color_score = (
+            mean_final_to_ref_ab
+            + 0.10 * mean_final_to_ref_hue
+            + 0.50 * mean_final_to_ref_chroma
+        )
         balanced_score = (
             color_score
             + artifact_penalty
             + 0.25 * avg_losses["face_keep_l1"]
         )
         anchor_change = self.anchor_max_abs_change() if stage == "B" else 0.0
-        if self.collapse_reference is None:
-            self.collapse_reference = {
-                "high_chroma_mean_mix": high_chroma_mean_mix,
-                "high_chroma_ab_error": high_chroma_ab_error,
-            }
-        if stage == "B" and self.stage_b_start_layer_mix is None:
-            self.stage_b_start_layer_mix = high_chroma_mean_mix
-        reference_mix = self.collapse_reference["high_chroma_mean_mix"]
-        reference_ab = self.collapse_reference["high_chroma_ab_error"]
+        alpha_collapsed = (
+            teacher_alpha_std > USER_TEACHER_DIVERSE_STD
+            and predicted_alpha_std < USER_ALPHA_COLLAPSE_STD
+        )
+        pseudo_systematic_failure = (
+            pseudo_failure_fraction > USER_PSEUDO_FIDELITY_BAD_FRACTION
+        )
         sample4 = next(
             (record for record in validation_records if record["sample_index"] == 4),
             None,
@@ -1778,59 +2026,73 @@ class BlendingTrainerV8:
             "stage": stage,
             "sample_count": len(validation_records),
             "high_chroma_count": len(high_chroma_records),
-            "high_chroma_ab_error": high_chroma_ab_error,
-            "high_chroma_hue_error": high_chroma_hue_error,
-            "high_chroma_mean_mix": high_chroma_mean_mix,
-            "anchor_high_chroma_ab_error": anchor_high_chroma_ab_error,
-            "anchor_high_chroma_hue_error": anchor_high_chroma_hue_error,
-            "fixed_high_chroma_ab_error": fixed_high_chroma_ab_error,
-            "fixed_high_chroma_hue_error": fixed_high_chroma_hue_error,
-            "fixed_color_score": (
-                fixed_high_chroma_ab_error + 0.10 * fixed_high_chroma_hue_error
+            "mean_pseudo_to_ref_ab": mean_pseudo_to_ref_ab,
+            "mean_pseudo_to_ref_hue": mean_pseudo_to_ref_hue,
+            "mean_final_to_ref_ab": mean_final_to_ref_ab,
+            "mean_final_to_ref_hue": mean_final_to_ref_hue,
+            "mean_final_to_ref_chroma": mean_final_to_ref_chroma,
+            "high_color_final_to_ref_ab": high_color_final_to_ref_ab,
+            "high_color_final_to_ref_hue": high_color_final_to_ref_hue,
+            "high_color_final_to_ref_chroma": high_color_final_to_ref_chroma,
+            "high_color_reference_score": (
+                high_color_final_to_ref_ab
+                + 0.10 * high_color_final_to_ref_hue
+                + 0.50 * high_color_final_to_ref_chroma
             ),
-            "reference_high_chroma_mean_mix": reference_mix,
-            "reference_high_chroma_ab_error": reference_ab,
-            "high_chroma_mix_change_from_reference": high_chroma_mean_mix - reference_mix,
-            "high_chroma_ab_change_fraction_from_reference": (
-                (high_chroma_ab_error - reference_ab) / max(reference_ab, 1e-6)
-            ),
+            "teacher_alpha_mae": teacher_alpha_mae,
+            "teacher_alpha_std": teacher_alpha_std,
+            "predicted_alpha_mean": predicted_alpha_mean,
+            "predicted_alpha_std": predicted_alpha_std,
+            "alpha_low_fraction": float((predicted_alphas <= 0.25).mean()),
+            "alpha_high_fraction": float((predicted_alphas >= 0.85).mean()),
+            "pseudo_fidelity_bad_count": len(pseudo_failure_records),
+            "pseudo_fidelity_bad_fraction": pseudo_failure_fraction,
+            "alpha_collapsed": alpha_collapsed,
+            "pseudo_systematic_failure": pseudo_systematic_failure,
+            "allow_best_checkpoint": not alpha_collapsed,
             "global_frac_l_excess_gt12": avg_losses["frac_l_excess_gt12"],
             "mean_face_keep_loss": avg_losses["face_keep_l1"],
             "color_score": color_score,
             "artifact_penalty": artifact_penalty,
             "balanced_score": balanced_score,
             "stage_b_anchor_max_abs_change": anchor_change,
-            "stage_b_start_layer_mix": self.stage_b_start_layer_mix,
-            "stage_b_end_layer_mix": high_chroma_mean_mix if stage == "B" else None,
-            "stage_b_layer_mix_abs_change": (
-                abs(high_chroma_mean_mix - self.stage_b_start_layer_mix)
-                if stage == "B" and self.stage_b_start_layer_mix is not None
-                else 0.0
-            ),
             "sample4_ab_error": (
-                None if sample4 is None else sample4["final_result_to_pseudo_ab_l2"]
+                None if sample4 is None else sample4["final_to_reference_ab_error"]
             ),
-            "sample4_hue_error": None if sample4 is None else sample4["final_hue_error"],
+            "sample4_hue_error": (
+                None if sample4 is None else sample4["final_to_reference_hue_error"]
+            ),
+            "sample4_predicted_alpha": (
+                None if sample4 is None else sample4["predicted_alpha"]
+            ),
             "val_loss": avg_losses["loss"],
         }
 
-        if high_chroma_mean_mix < USER_MIN_HIGH_CHROMA_MIX:
+        if alpha_collapsed:
             print(
-                "[COLLAPSE WARNING] "
-                f"high_chroma_mean_mix={high_chroma_mean_mix:.6f} "
-                f"minimum={USER_MIN_HIGH_CHROMA_MIX:.6f}",
+                "[ALPHA COLLAPSE WARNING] "
+                f"teacher_alpha_std={teacher_alpha_std:.6f} "
+                f"predicted_alpha_std={predicted_alpha_std:.6f}",
+                file=sys.stderr,
+            )
+        if pseudo_systematic_failure:
+            print(
+                "[PSEUDO TARGET SYSTEMATIC FAILURE] "
+                f"bad_fraction={pseudo_failure_fraction:.2%} "
+                f"limit={USER_PSEUDO_FIDELITY_BAD_FRACTION:.2%}",
+                file=sys.stderr,
+            )
+        for record in pseudo_failure_records:
+            print(
+                "[PSEUDO TARGET FIDELITY WARNING] "
+                f"sample={record['sample_id']} "
+                f"ab={record['pseudo_to_reference_ab_error']:.4f} "
+                f"hue={record['pseudo_to_reference_hue_error']:.4f}",
                 file=sys.stderr,
             )
         if stage == "B" and anchor_change >= 1e-7:
             raise RuntimeError(
                 f"Stage B anchor changed during validation: max_abs_change={anchor_change:.9g}"
-            )
-        if color_score > validation_summary["fixed_color_score"]:
-            print(
-                "[FIXED MIX BASELINE WARNING] learned anchor underperforms fixed mix 0.70: "
-                f"learned_score={color_score:.6f} "
-                f"fixed_score={validation_summary['fixed_color_score']:.6f}",
-                file=sys.stderr,
             )
 
         epoch_dir = self.output_val_dir / (
@@ -1841,10 +2103,29 @@ class BlendingTrainerV8:
             json.dump(validation_records, handle, ensure_ascii=False, indent=2)
         with open(epoch_dir / "summary.json", "w", encoding="utf-8") as handle:
             json.dump(validation_summary, handle, ensure_ascii=False, indent=2)
+        failure_lines = [
+            (
+                f"{record['sample_index']}\t{record['sample_id']}\t"
+                f"ab={record['pseudo_to_reference_ab_error']:.6f}\t"
+                f"hue={record['pseudo_to_reference_hue_error']:.6f}"
+            )
+            for record in pseudo_failure_records
+        ]
+        failure_text = "\n".join(failure_lines) + ("\n" if failure_lines else "")
+        (epoch_dir / "pseudo_target_failure_cases.txt").write_text(
+            failure_text, encoding="utf-8"
+        )
+        (ACTIVE_OUTPUT_DIR / "pseudo_target_failure_cases.txt").write_text(
+            failure_text, encoding="utf-8"
+        )
         if epoch < 0 or epoch % USER_SAVE_PREVIEW_EVERY == 0:
             for idx, row in enumerate(preview_rows):
                 save_preview(epoch_dir / f"sample_{idx:03d}.png", row)
-                save_preview(epoch_dir / f"sample_{idx:03d}_direct_diagnostic.png", direct_preview_rows[idx])
+                if idx in USER_FIXED_REGRESSION_INDICES:
+                    save_preview(
+                        epoch_dir / f"sample_{idx:03d}_direct_alpha_diagnostic.png",
+                        direct_preview_rows[idx],
+                    )
 
         print(
             f"[blending_v8] validation={validation_label} correction={correction_enabled} "
@@ -1863,10 +2144,11 @@ class BlendingTrainerV8:
             f"val_ab_error={avg_losses['result_to_pseudo_ab_l2']:.6f} "
             f"val_frac_excess_gt12={avg_losses['frac_l_excess_gt12']:.6f} "
             f"val_skin={avg_losses['skin_chroma_keep']:.6f} "
-            f"high_chroma_ab={high_chroma_ab_error:.6f} "
-            f"high_chroma_hue={high_chroma_hue_error:.6f} "
-            f"high_chroma_mix={high_chroma_mean_mix:.6f} "
-            f"anchor_high_chroma_ab={anchor_high_chroma_ab_error:.6f} "
+            f"final_ref_ab={mean_final_to_ref_ab:.6f} "
+            f"final_ref_hue={mean_final_to_ref_hue:.6f} "
+            f"final_ref_chroma={mean_final_to_ref_chroma:.6f} "
+            f"predicted_alpha_mean={predicted_alpha_mean:.6f} "
+            f"predicted_alpha_std={predicted_alpha_std:.6f} "
             f"anchor_change={anchor_change:.3e} "
             f"color_score={color_score:.6f} balanced_score={balanced_score:.6f}"
         )
@@ -1898,28 +2180,30 @@ class BlendingTrainerV8:
             )
             print(f"[blending_v8] epoch={epoch + 1} train_loss={train_loss:.6f}")
 
-            high_chroma_ab = validation_summary["high_chroma_ab_error"]
+            high_color_reference_score = validation_summary["high_color_reference_score"]
             color_regressed = (
-                self.best_high_chroma_ab_error < float("inf")
-                and high_chroma_ab
-                > self.best_high_chroma_ab_error * (1.0 + USER_COLOR_REGRESSION_LIMIT)
+                self.best_high_color_reference_score < float("inf")
+                and high_color_reference_score
+                > self.best_high_color_reference_score * (1.0 + USER_COLOR_REGRESSION_LIMIT)
             )
             if color_regressed:
                 print(
                     "[COLOR REGRESSION WARNING] "
-                    f"high_chroma_ab={high_chroma_ab:.6f} "
-                    f"historical_best={self.best_high_chroma_ab_error:.6f} "
+                    f"high_color_reference_score={high_color_reference_score:.6f} "
+                    f"historical_best={self.best_high_color_reference_score:.6f} "
                     f"limit={USER_COLOR_REGRESSION_LIMIT:.1%}",
                     file=sys.stderr,
                 )
-            self.best_high_chroma_ab_error = min(
-                self.best_high_chroma_ab_error,
-                high_chroma_ab,
+            self.best_high_color_reference_score = min(
+                self.best_high_color_reference_score,
+                high_color_reference_score,
             )
+            allow_best = bool(validation_summary["allow_best_checkpoint"])
 
             if self.current_stage == "A":
                 is_stage_a_best = (
-                    validation_summary["color_score"] <= self.stage_a_best_color_score
+                    allow_best
+                    and validation_summary["color_score"] <= self.stage_a_best_color_score
                 )
                 if is_stage_a_best:
                     self.stage_a_best_color_score = validation_summary["color_score"]
@@ -1931,13 +2215,17 @@ class BlendingTrainerV8:
                 if (epoch + 1) % USER_SAVE_CHECKPOINT_EVERY == 0:
                     self.save_checkpoint(epoch + 1, "stage_a_last", validation_summary)
             else:
-                is_best_color = validation_summary["color_score"] <= self.best_color_score
+                is_best_color = (
+                    allow_best
+                    and validation_summary["color_score"] <= self.best_color_score
+                )
                 if is_best_color:
                     self.best_color_score = validation_summary["color_score"]
                     self.save_checkpoint(epoch + 1, "best_color", validation_summary)
 
                 is_best_balanced = (
-                    not color_regressed
+                    allow_best
+                    and not color_regressed
                     and validation_summary["balanced_score"] <= self.best_balanced_score
                 )
                 if is_best_balanced:
@@ -1965,12 +2253,36 @@ def main():
         )
 
     ensure_dataset_cache_v8(triplets)
+    if not USER_REQUIRE_TEACHER_CACHE:
+        raise RuntimeError("V8.4 Stage A requires an explicit direct-strength teacher cache")
+    teacher_cache_path = ACTIVE_DATASET_DIR / USER_TEACHER_CACHE_NAME
+    teacher_payload = load_teacher_cache(teacher_cache_path)
+    cached_candidates = tuple(float(value) for value in teacher_payload.get("alpha_candidates", ()))
+    expected_candidates = tuple(float(value) for value in USER_TEACHER_ALPHA_CANDIDATES)
+    if cached_candidates != expected_candidates:
+        raise RuntimeError(
+            f"Teacher cache candidates={cached_candidates} do not match "
+            f"USER_TEACHER_ALPHA_CANDIDATES={expected_candidates}"
+        )
+    teacher_records = teacher_payload["records"]
     train_exps, val_exps = train_test_split(triplets, test_size=ACTIVE_VAL_SIZE, random_state=USER_RANDOM_SEED)
     device = torch.device(USER_DEVICE if torch.cuda.is_available() else "cpu")
     helper = MaskPrepHelper(device)
 
-    train_dataset = BlendingDatasetV8(train_exps, ACTIVE_DATASET_DIR, ACTIVE_FACE_ROOT, ACTIVE_COLOR_ROOT)
-    val_dataset = BlendingDatasetV8(val_exps, ACTIVE_DATASET_DIR, ACTIVE_FACE_ROOT, ACTIVE_COLOR_ROOT)
+    train_dataset = BlendingDatasetV8(
+        train_exps,
+        ACTIVE_DATASET_DIR,
+        ACTIVE_FACE_ROOT,
+        ACTIVE_COLOR_ROOT,
+        teacher_records,
+    )
+    val_dataset = BlendingDatasetV8(
+        val_exps,
+        ACTIVE_DATASET_DIR,
+        ACTIVE_FACE_ROOT,
+        ACTIVE_COLOR_ROOT,
+        teacher_records,
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=USER_BATCH_SIZE,
@@ -1990,11 +2302,8 @@ def main():
 
     model = BlendingModel(
         USER_CLIP_MODEL,
-        direct_mix_init=USER_DIRECT_MIX_INIT,
-        direct_mix_floor_low=USER_DIRECT_MIX_FLOOR_LOW,
-        direct_mix_floor_high=USER_DIRECT_MIX_FLOOR_HIGH,
-        direct_mix_mode=USER_DIRECT_MIX_MODE,
-        direct_mix_fixed=USER_DIRECT_MIX_FIXED,
+        alpha_init=USER_ALPHA_INIT,
+        layer_offset_max=USER_LAYER_OFFSET_MAX,
         correction_chroma_budget_ratio=USER_CORRECTION_CHROMA_BUDGET_RATIO,
         correction_luma_budget_ratio=USER_CORRECTION_LUMA_BUDGET_RATIO,
         correction_orth_scale=USER_CORRECTION_ORTH_SCALE,
@@ -2011,7 +2320,7 @@ def main():
     print(
         f"[blending_v8] train_on_shape_satd_align=True "
         f"author_color_align_aux={USER_AUTHOR_COLOR_ALIGN_BATCH_PROB > 0} use_satd_v8={USER_USE_SATD_V8} "
-        f"arch={DIRECT_COLOR_ARCH_V8_3} fresh_adapter=True "
+        f"arch={DIRECT_COLOR_ARCH_V8_4} fresh_adapter=True "
         f"satd_checkpoint={USER_SATD_CHECKPOINT_V8} "
         f"batch_size={USER_BATCH_SIZE} grad_accum_steps={USER_GRAD_ACCUM_STEPS} "
         f"effective_batch_size={USER_BATCH_SIZE * USER_GRAD_ACCUM_STEPS} "
@@ -2022,14 +2331,15 @@ def main():
         f"positive_luma_w={USER_POSITIVE_LUMA_EXCESS_WEIGHT} "
         f"hf_luma_w={USER_HF_LUMA_EXCESS_WEIGHT} "
         f"correction_norm_w={USER_CORRECTION_NORM_WEIGHT} "
-        f"chroma_gate_thresholds=({USER_CHROMA_NO_EDIT_THRESHOLD_V8},{USER_CHROMA_FULL_EDIT_THRESHOLD_V8}) "
+        f"ab_gate_thresholds=({USER_AB_NO_EDIT},{USER_AB_FULL_EDIT}) "
+        f"hue_gate_thresholds=({USER_HUE_NO_EDIT_DEG},{USER_HUE_FULL_EDIT_DEG}) "
+        f"chroma_magnitude_thresholds=({USER_CHROMA_MAG_NO_EDIT},{USER_CHROMA_MAG_FULL_EDIT}) "
+        f"distribution_thresholds=({USER_COLOR_DIST_NO_EDIT},{USER_COLOR_DIST_FULL_EDIT}) "
         f"lightness_gate_thresholds=({USER_LIGHTNESS_NO_EDIT_THRESHOLD_V8},{USER_LIGHTNESS_FULL_EDIT_THRESHOLD_V8}) "
         f"max_global_l_shift={USER_MAX_GLOBAL_L_SHIFT_V8} "
         f"min_safe_reference_fraction={USER_MIN_SAFE_REFERENCE_FRACTION_V8} "
-        f"direct_mix_init={USER_DIRECT_MIX_INIT} "
-        f"direct_mix_mode={USER_DIRECT_MIX_MODE} "
-        f"direct_mix_floors=({USER_DIRECT_MIX_FLOOR_LOW},{USER_DIRECT_MIX_FLOOR_HIGH}) "
-        f"direct_mix_target=({USER_DIRECT_MIX_TARGET_LOW},{USER_DIRECT_MIX_TARGET_HIGH}) "
+        f"alpha_init={USER_ALPHA_INIT} layer_offset_max={USER_LAYER_OFFSET_MAX} "
+        f"teacher_cache={teacher_cache_path} "
         f"correction_budget_ratios=({USER_CORRECTION_CHROMA_BUDGET_RATIO},"
         f"{USER_CORRECTION_LUMA_BUDGET_RATIO}) "
         f"correction_orth_scale={USER_CORRECTION_ORTH_SCALE} "

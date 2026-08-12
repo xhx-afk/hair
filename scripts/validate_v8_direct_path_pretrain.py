@@ -13,7 +13,7 @@ import scripts.validate_v8_color_direction_diagnostic as diagnostic
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Validate the untrained V8.3 direct color path")
+    parser = argparse.ArgumentParser(description="Validate the untrained V8.4 direct color path")
     parser.add_argument("--val-indices", type=int, nargs="+", default=[4, 20])
     parser.add_argument("--dataset-dir", type=Path, default=train_v8.ACTIVE_DATASET_DIR)
     parser.add_argument("--face-root", type=Path, default=train_v8.ACTIVE_FACE_ROOT)
@@ -45,7 +45,7 @@ def main():
             color_root=args.color_root,
             output_dir=args.output_dir,
             correction_enabled=False,
-            run_label="untrained_direct_color_anchor_v8_3",
+            run_label="untrained_direct_color_anchor_v8_4",
         ))
     args.output_dir.mkdir(parents=True, exist_ok=True)
     with open(args.output_dir / "pretrain_metrics.json", "w", encoding="utf-8") as handle:

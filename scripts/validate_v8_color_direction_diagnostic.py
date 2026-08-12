@@ -10,11 +10,11 @@ from sklearn.model_selection import train_test_split
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import scripts.blending_train_v8 as train_v8
-from models.Encoders import DIRECT_COLOR_ARCH_V8_3, load_direct_color_adapter_state_v8
+from models.Encoders import DIRECT_COLOR_ARCH_V8_4, load_direct_color_adapter_state_v8
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run one direct-color-anchor V8.3 regression sample")
+    parser = argparse.ArgumentParser(description="Run one direct-color-anchor V8.4 regression sample")
     parser.add_argument("--val-index", type=int, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--dataset-dir", type=Path, default=train_v8.ACTIVE_DATASET_DIR)
@@ -31,42 +31,36 @@ def scalar(value: torch.Tensor) -> float:
 def create_untrained_model(device: torch.device):
     return train_v8.BlendingModel(
         train_v8.USER_CLIP_MODEL,
-        direct_mix_init=train_v8.USER_DIRECT_MIX_INIT,
-        direct_mix_floor_low=train_v8.USER_DIRECT_MIX_FLOOR_LOW,
-        direct_mix_floor_high=train_v8.USER_DIRECT_MIX_FLOOR_HIGH,
-        direct_mix_mode=train_v8.USER_DIRECT_MIX_MODE,
-        direct_mix_fixed=train_v8.USER_DIRECT_MIX_FIXED,
+        alpha_init=train_v8.USER_ALPHA_INIT,
+        layer_offset_max=train_v8.USER_LAYER_OFFSET_MAX,
         correction_chroma_budget_ratio=train_v8.USER_CORRECTION_CHROMA_BUDGET_RATIO,
         correction_luma_budget_ratio=train_v8.USER_CORRECTION_LUMA_BUDGET_RATIO,
         correction_orth_scale=train_v8.USER_CORRECTION_ORTH_SCALE,
     ).to(device).eval()
 
 
-def load_v3_checkpoint(model: torch.nn.Module, checkpoint_path: Path, device: torch.device) -> None:
+def load_v4_checkpoint(model: torch.nn.Module, checkpoint_path: Path, device: torch.device) -> None:
     checkpoint = torch.load(checkpoint_path, map_location=device)
     checkpoint_arch = checkpoint.get("arch") if isinstance(checkpoint, dict) else None
-    if checkpoint_arch != DIRECT_COLOR_ARCH_V8_3:
+    if checkpoint_arch != DIRECT_COLOR_ARCH_V8_4:
         raise RuntimeError(
             f"Refusing incompatible checkpoint {checkpoint_path}: "
-            f"arch={checkpoint_arch!r}, required={DIRECT_COLOR_ARCH_V8_3!r}"
+            f"arch={checkpoint_arch!r}, required={DIRECT_COLOR_ARCH_V8_4!r}"
         )
     adapter_config = checkpoint.get("adapter_config", {})
-    model.direct_mix_init = float(adapter_config.get("direct_mix_init", model.direct_mix_init))
+    model.alpha_init = float(adapter_config.get("alpha_init", model.alpha_init))
+    model.layer_offset_max = float(adapter_config.get("layer_offset_max", model.layer_offset_max))
     for key in (
-        "direct_mix_floor_low",
-        "direct_mix_floor_high",
-        "direct_mix_fixed",
         "correction_chroma_budget_ratio",
         "correction_luma_budget_ratio",
         "correction_orth_scale",
     ):
         setattr(model, key, float(adapter_config.get(key, getattr(model, key))))
-    model.direct_mix_mode = adapter_config.get("direct_mix_mode", model.direct_mix_mode)
     report = load_direct_color_adapter_state_v8(model, checkpoint["model_state_dict"])
     model.set_anchor_trainable(False)
     model.set_correction_trainable(False)
     print(
-        f"[v8_direct_diagnostic] loaded arch={DIRECT_COLOR_ARCH_V8_3} "
+        f"[v8_direct_diagnostic] loaded arch={DIRECT_COLOR_ARCH_V8_4} "
         f"strict adapter tensors={len(report['loaded'])}",
         file=sys.stderr,
     )
@@ -104,7 +98,11 @@ def prepare_validation_case(
     item = train_v8.prepare_item(triplet, dataset_dir, face_root, color_root)
     if item is None:
         raise RuntimeError(f"Could not load cached data for triplet={triplet}")
-    batch = tuple(tensor.unsqueeze(0) for tensor in item)
+    batch = tuple(tensor.unsqueeze(0) for tensor in item) + (
+        [train_v8.triplet_cache_key(triplet)],
+        torch.tensor([float("nan")]),
+        torch.tensor([0.0]),
+    )
     prepared = trainer.prepare_batch(batch)
     if prepared is None:
         raise RuntimeError(f"No valid target/reference hair pixels for triplet={triplet}")
@@ -147,7 +145,7 @@ def run_case(
     fixed_direct_tail, _ = trainer.run_adapter(
         prepared,
         correction_enabled=False,
-        layer_mix_override=model.direct_mix_fixed,
+        layer_mix_override=train_v8.USER_DIAGNOSTIC_ALPHA,
     )
     anchor_tail, anchor_aux = trainer.run_adapter(prepared, correction_enabled=False)
     generated_256 = render_tail(trainer, prepared, blend_tail)
@@ -256,7 +254,7 @@ def main():
         raise FileNotFoundError(f"Cannot find checkpoint: {args.checkpoint}")
     device = torch.device(train_v8.USER_DEVICE if torch.cuda.is_available() else "cpu")
     model = create_untrained_model(device)
-    load_v3_checkpoint(model, args.checkpoint, device)
+    load_v4_checkpoint(model, args.checkpoint, device)
     trainer, _ = create_trainer(model, device)
     metrics = run_case(
         model=model,

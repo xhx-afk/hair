@@ -110,7 +110,7 @@ def get_parser_v8():
     parser.add_argument(
         "--blending_checkpoint",
         type=str,
-        default="output/blending_train_v8_direct_anchor_v2_1/checkpoints/best_balanced.pth",
+        default="output/blending_train_v8_direct_anchor_v2_2_small/checkpoints/best_balanced.pth",
     )
     parser.add_argument("--pp_checkpoint", type=str, default="pretrained_models/PostProcess/pp_model.pth")
     parser.add_argument("--use_satd_v8", action="store_true")
@@ -118,21 +118,23 @@ def get_parser_v8():
     parser.add_argument("--satd_blend_v8", type=float, default=0.28)
     parser.add_argument("--satd_boundary_v8", type=int, default=8)
     parser.add_argument("--eq8_reference_blend_v8", type=float, default=0.0)
-    parser.add_argument("--chroma-no-edit-threshold-v8", type=float, default=3.0)
-    parser.add_argument("--chroma-full-edit-threshold-v8", type=float, default=19.0)
+    parser.add_argument("--ab-no-edit-threshold-v8", type=float, default=1.5)
+    parser.add_argument("--ab-full-edit-threshold-v8", type=float, default=15.0)
+    parser.add_argument("--hue-no-edit-deg-v8", type=float, default=4.0)
+    parser.add_argument("--hue-full-edit-deg-v8", type=float, default=30.0)
+    parser.add_argument("--chroma-mag-no-edit-v8", type=float, default=2.0)
+    parser.add_argument("--chroma-mag-full-edit-v8", type=float, default=15.0)
+    parser.add_argument("--color-dist-no-edit-v8", type=float, default=2.0)
+    parser.add_argument("--color-dist-full-edit-v8", type=float, default=15.0)
     parser.add_argument("--lightness-no-edit-threshold-v8", type=float, default=3.0)
     parser.add_argument("--lightness-full-edit-threshold-v8", type=float, default=15.0)
-    parser.add_argument("--max-global-l-shift-v8", type=float, default=20.0)
+    parser.add_argument("--max-global-l-shift-v8", type=float, default=40.0)
+    parser.add_argument("--relative-luma-bins-v8", type=int, default=8)
+    parser.add_argument("--relative-luma-min-scale-v8", type=float, default=3.0)
+    parser.add_argument("--global-ab-fallback-min-reliability-v8", type=float, default=0.5)
     parser.add_argument("--min-safe-reference-fraction-v8", type=float, default=0.35)
-    parser.add_argument("--direct-mix-init-v8", type=float, default=0.70)
-    parser.add_argument("--direct-mix-floor-low-v8", type=float, default=0.10)
-    parser.add_argument("--direct-mix-floor-high-v8", type=float, default=0.60)
-    parser.add_argument(
-        "--direct-mix-mode-v8",
-        choices=("fixed", "learned_retained"),
-        default="learned_retained",
-    )
-    parser.add_argument("--direct-mix-fixed-v8", type=float, default=0.70)
+    parser.add_argument("--alpha-init-v8", type=float, default=0.70)
+    parser.add_argument("--layer-offset-max-v8", type=float, default=0.15)
     parser.add_argument("--correction-chroma-budget-ratio-v8", type=float, default=0.15)
     parser.add_argument("--correction-luma-budget-ratio-v8", type=float, default=0.10)
     parser.add_argument("--correction-orth-scale-v8", type=float, default=0.25)

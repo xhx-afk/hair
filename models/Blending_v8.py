@@ -2,7 +2,7 @@ import torch
 
 from models.Blending import Blending
 from models.Encoders import (
-    DIRECT_COLOR_ARCH_V8_3,
+    DIRECT_COLOR_ARCH_V8_4,
     DirectColorBlendAdapterV8,
     PostProcessModel,
     load_direct_color_adapter_state_v8,
@@ -28,28 +28,19 @@ class Blending_v8(Blending):
 
         checkpoint = torch.load(self.opts.blending_checkpoint, map_location=self.opts.device)
         checkpoint_arch = checkpoint.get("arch") if isinstance(checkpoint, dict) else None
-        if checkpoint_arch != DIRECT_COLOR_ARCH_V8_3:
+        if checkpoint_arch != DIRECT_COLOR_ARCH_V8_4:
             raise RuntimeError(
                 f"Refusing incompatible BlendingV8 checkpoint {self.opts.blending_checkpoint}: "
-                f"arch={checkpoint_arch!r}, required={DIRECT_COLOR_ARCH_V8_3!r}"
+                f"arch={checkpoint_arch!r}, required={DIRECT_COLOR_ARCH_V8_4!r}"
             )
         adapter_config = checkpoint.get("adapter_config", {})
         self.blending_encoder = DirectColorBlendAdapterV8(
             checkpoint.get("clip", "ViT-B/32"),
-            direct_mix_init=adapter_config.get(
-                "direct_mix_init", getattr(self.opts, "direct_mix_init_v8", 0.70)
+            alpha_init=adapter_config.get(
+                "alpha_init", getattr(self.opts, "alpha_init_v8", 0.70)
             ),
-            direct_mix_floor_low=adapter_config.get(
-                "direct_mix_floor_low", getattr(self.opts, "direct_mix_floor_low_v8", 0.10)
-            ),
-            direct_mix_floor_high=adapter_config.get(
-                "direct_mix_floor_high", getattr(self.opts, "direct_mix_floor_high_v8", 0.60)
-            ),
-            direct_mix_mode=adapter_config.get(
-                "direct_mix_mode", getattr(self.opts, "direct_mix_mode_v8", "learned_retained")
-            ),
-            direct_mix_fixed=adapter_config.get(
-                "direct_mix_fixed", getattr(self.opts, "direct_mix_fixed_v8", 0.70)
+            layer_offset_max=adapter_config.get(
+                "layer_offset_max", getattr(self.opts, "layer_offset_max_v8", 0.15)
             ),
             correction_chroma_budget_ratio=adapter_config.get(
                 "correction_chroma_budget_ratio",
@@ -68,7 +59,7 @@ class Blending_v8(Blending):
         self.blending_encoder.set_anchor_trainable(False)
         self.blending_encoder.set_correction_trainable(False)
         print(
-            f"[Blending_v8] loaded arch={DIRECT_COLOR_ARCH_V8_3} "
+            f"[Blending_v8] loaded arch={DIRECT_COLOR_ARCH_V8_4} "
             f"strict adapter tensors={len(report['loaded'])}"
         )
         self.blending_encoder.to(self.opts.device).eval()
@@ -79,11 +70,22 @@ class Blending_v8(Blending):
         self.dilate_erosion = DilateErosion(dilate_erosion=self.opts.smooth, device=self.opts.device)
         self.downsample_256 = BicubicDownSample(factor=4)
         self.color_config = ColorConditionConfigV8(
-            chroma_no_edit_threshold=getattr(self.opts, "chroma_no_edit_threshold_v8", 3.0),
-            chroma_full_edit_threshold=getattr(self.opts, "chroma_full_edit_threshold_v8", 19.0),
+            ab_no_edit_threshold=getattr(self.opts, "ab_no_edit_threshold_v8", 1.5),
+            ab_full_edit_threshold=getattr(self.opts, "ab_full_edit_threshold_v8", 15.0),
+            hue_no_edit_deg=getattr(self.opts, "hue_no_edit_deg_v8", 4.0),
+            hue_full_edit_deg=getattr(self.opts, "hue_full_edit_deg_v8", 30.0),
+            chroma_mag_no_edit=getattr(self.opts, "chroma_mag_no_edit_v8", 2.0),
+            chroma_mag_full_edit=getattr(self.opts, "chroma_mag_full_edit_v8", 15.0),
+            color_dist_no_edit=getattr(self.opts, "color_dist_no_edit_v8", 2.0),
+            color_dist_full_edit=getattr(self.opts, "color_dist_full_edit_v8", 15.0),
             lightness_no_edit_threshold=getattr(self.opts, "lightness_no_edit_threshold_v8", 3.0),
             lightness_full_edit_threshold=getattr(self.opts, "lightness_full_edit_threshold_v8", 15.0),
-            max_global_l_shift=getattr(self.opts, "max_global_l_shift_v8", 20.0),
+            max_global_l_shift=getattr(self.opts, "max_global_l_shift_v8", 40.0),
+            relative_luma_bins=getattr(self.opts, "relative_luma_bins_v8", 8),
+            relative_luma_min_scale=getattr(self.opts, "relative_luma_min_scale_v8", 3.0),
+            global_ab_fallback_min_reliability=getattr(
+                self.opts, "global_ab_fallback_min_reliability_v8", 0.5
+            ),
             min_safe_fraction=getattr(self.opts, "min_safe_reference_fraction_v8", 0.35),
         )
 
@@ -179,8 +181,17 @@ class Blending_v8(Blending):
                     edit_need_gate=bundle["edit_need_gate"],
                     safe_ref_mask=bundle["safe_ref_mask"],
                     rejected_highlight_mask=bundle["rejected_highlight_mask"],
+                    composite_color_distance=bundle["composite_color_distance"],
+                    hue_distance_deg=bundle["hue_distance_deg"],
+                    chroma_distance=bundle["chroma_distance"],
+                    distribution_distance=bundle["distribution_distance"],
+                    relative_luma_reliability=bundle["relative_luma_reliability"],
+                    pseudo_reference_fidelity=bundle["pseudo_reference_fidelity"],
                     direct_delta_norm=blending_aux["direct_delta_norm"],
                     direct_component_norm=blending_aux["direct_component_norm"],
+                    predicted_alpha=blending_aux["predicted_alpha"],
+                    layer_offset=blending_aux["layer_offset"],
+                    effective_layer_mix=blending_aux["effective_layer_mix"],
                     layer_mix=blending_aux["layer_mix"],
                     correction_norm=blending_aux["correction_norm"],
                     correction_budget=blending_aux["correction_budget"],

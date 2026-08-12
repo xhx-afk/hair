@@ -1,0 +1,15 @@
+{
+  "status": "not_run",
+  "reason": "Dataset manifests and StyleGAN/SATD checkpoints are not present in this workspace; the yolov11 environment also lacks the original project dependency addict.",
+  "sample_count": null,
+  "mean_alpha": null,
+  "median_alpha": null,
+  "std_alpha": null,
+  "alpha_eq_0_fraction": null,
+  "alpha_le_025_fraction": null,
+  "alpha_ge_085_fraction": null,
+  "alpha_eq_1_fraction": null,
+  "alpha_eq_070_fraction": null,
+  "high_chroma_mean_alpha": null,
+  "white_light_hair_mean_alpha": null
+}

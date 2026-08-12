@@ -67,6 +67,7 @@ def main():
     output_noop, _ = run_model(
         model, latent_face, latent_color, descriptor, zeros,
         correction_enabled=False,
+        layer_mix_override=0.0,
     )
     assert torch.equal(output_noop, latent_face), "Test A: gate=0 must be an exact no-op"
 
@@ -116,13 +117,13 @@ def main():
     report = load_direct_color_adapter_state_v8(reloaded, saved_state)
     assert len(report["loaded"]) == len(saved_state)
     incomplete_state = dict(saved_state)
-    incomplete_state.pop("layer_mix_head.bias")
+    incomplete_state.pop("strength_head.2.bias")
     try:
         load_direct_color_adapter_state_v8(reloaded, incomplete_state)
     except RuntimeError:
         pass
     else:
-        raise AssertionError("Strict V2 state loading accepted a missing non-CLIP tensor")
+        raise AssertionError("Strict V8.4 state loading accepted a missing non-CLIP tensor")
 
     print(
         "direct_color_adapter_v8 tests passed: "

@@ -14,20 +14,25 @@ def main():
     model.set_anchor_trainable(True)
     model.set_correction_trainable(False)
     assert all(parameter.requires_grad for parameter in parameters(model.descriptor_encoder))
-    assert all(parameter.requires_grad for parameter in parameters(model.layer_mix_head))
+    assert all(parameter.requires_grad for parameter in parameters(model.strength_head))
+    assert all(parameter.requires_grad for parameter in parameters(model.layer_offset_head))
     assert not any(parameter.requires_grad for parameter in parameters(model.layer_embedding))
     assert not any(parameter.requires_grad for parameter in parameters(model.correction_mlp))
 
     model.set_anchor_trainable(False)
     model.set_correction_trainable(True)
     assert not any(parameter.requires_grad for parameter in parameters(model.descriptor_encoder))
-    assert not any(parameter.requires_grad for parameter in parameters(model.layer_mix_head))
+    assert not any(parameter.requires_grad for parameter in parameters(model.strength_head))
+    assert not any(parameter.requires_grad for parameter in parameters(model.layer_offset_head))
     assert all(parameter.requires_grad for parameter in parameters(model.layer_embedding))
     assert all(parameter.requires_grad for parameter in parameters(model.correction_mlp))
 
     anchor_before = {
         name: value.detach().clone()
-        for name, value in model.layer_mix_head.state_dict().items()
+        for name, value in {
+            **{f"strength_head.{name}": value for name, value in model.strength_head.state_dict().items()},
+            **{f"layer_offset_head.{name}": value for name, value in model.layer_offset_head.state_dict().items()},
+        }.items()
     }
     correction_before = model.correction_mlp[-1].weight.detach().clone()
     optimizer = torch.optim.Adam(list(model.correction_parameters()), lr=1e-3)
@@ -47,7 +52,7 @@ def main():
     optimizer.step()
 
     anchor_change = max(
-        float((model.layer_mix_head.state_dict()[name] - value).abs().max())
+        float((model.state_dict()[name] - value).abs().max())
         for name, value in anchor_before.items()
     )
     correction_change = float(

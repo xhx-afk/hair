@@ -8,16 +8,29 @@ import torch.nn.functional as F
 from models.SG_IDCT_v16 import gaussian_blur2d, lab_to_rgb, rgb_to_lab
 
 
-COLOR_DESCRIPTOR_DIM = 20
+COLOR_DESCRIPTOR_DIM = 41
 
 
 @dataclass(frozen=True)
 class ColorConditionConfigV8:
-    chroma_no_edit_threshold: float = 3.0
-    chroma_full_edit_threshold: float = 19.0
+    ab_no_edit_threshold: float = 1.5
+    ab_full_edit_threshold: float = 15.0
+    hue_no_edit_deg: float = 4.0
+    hue_full_edit_deg: float = 30.0
+    chroma_mag_no_edit: float = 2.0
+    chroma_mag_full_edit: float = 15.0
+    color_dist_no_edit: float = 2.0
+    color_dist_full_edit: float = 15.0
     lightness_no_edit_threshold: float = 3.0
     lightness_full_edit_threshold: float = 15.0
-    max_global_l_shift: float = 20.0
+    max_global_l_shift: float = 40.0
+    hue_valid_chroma_center: float = 5.0
+    hue_valid_chroma_softness: float = 2.0
+    relative_luma_bins: int = 8
+    relative_luma_min_scale: float = 3.0
+    global_ab_fallback_min_reliability: float = 0.5
+    pseudo_fidelity_ab_bad: float = 8.0
+    pseudo_fidelity_hue_bad: float = 15.0
     min_safe_fraction: float = 0.35
     highlight_mad_scale: float = 1.8
     highlight_global_min_margin: float = 3.0
@@ -30,7 +43,6 @@ class ColorConditionConfigV8:
     highlight_softness_c: float = 1.5
     highlight_local_radius: int = 7
     reference_mask_erode: int = 2
-    conditional_luma_bins: int = 9
 
 
 def _as_image4d(image: torch.Tensor) -> torch.Tensor:
@@ -114,6 +126,174 @@ def masked_robust_stats(features: torch.Tensor, mask: torch.Tensor) -> dict[str,
         "median": median,
         "mad": mad,
     }
+
+
+def compute_intrinsic_hair_color_stats(
+    lab: torch.Tensor,
+    mask: torch.Tensor,
+    config: ColorConditionConfigV8 | None = None,
+) -> dict[str, torch.Tensor]:
+    """Compute alignment-free, robust per-sample hair color statistics."""
+    config = config or ColorConditionConfigV8()
+    if lab.dim() == 3:
+        lab = lab.unsqueeze(0)
+    if lab.dim() != 4 or lab.size(1) != 3:
+        raise ValueError(f"Expected Lab [B,3,H,W], got shape={tuple(lab.shape)}")
+    mask = _as_mask4d(mask, lab.shape[-2:], lab.size(0))
+    ab = lab[:, 1:3]
+    lightness = lab[:, 0:1]
+    chroma = torch.linalg.vector_norm(ab, dim=1, keepdim=True)
+    ab_stats = masked_robust_stats(ab, mask)
+    l_stats = masked_robust_stats(lightness, mask)
+    c_stats = masked_robust_stats(chroma, mask)
+    mean_ab = ab_stats["mean"]
+    hue_norm = torch.linalg.vector_norm(mean_ab, dim=1, keepdim=True)
+    hue_unit = mean_ab / hue_norm.clamp_min(1e-6)
+    neutral_hue = torch.tensor([1.0, 0.0], device=lab.device, dtype=lab.dtype)[None]
+    hue_unit = torch.where(hue_norm > 1e-6, hue_unit, neutral_hue)
+    median_chroma = c_stats["median"].squeeze(1)
+    hue_validity = torch.sigmoid(
+        (median_chroma - config.hue_valid_chroma_center)
+        / max(config.hue_valid_chroma_softness, 1e-4)
+    )
+    return {
+        "mean_ab": mean_ab,
+        "median_ab": ab_stats["median"],
+        "mean_chroma": c_stats["mean"].squeeze(1),
+        "median_chroma": median_chroma,
+        "std_ab": ab_stats["std"],
+        "hue_unit": hue_unit,
+        "hue_validity": hue_validity,
+        "l_median": l_stats["median"].squeeze(1),
+        "l_q25": _weighted_quantile(lightness, mask, 0.25).squeeze(1),
+        "l_q75": _weighted_quantile(lightness, mask, 0.75).squeeze(1),
+        "c_q25": _weighted_quantile(chroma, mask, 0.25).squeeze(1),
+        "c_q50": median_chroma,
+        "c_q75": _weighted_quantile(chroma, mask, 0.75).squeeze(1),
+    }
+
+
+def compute_composite_color_distance(
+    ref_stats: dict[str, torch.Tensor],
+    base_stats: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    delta_ab = ref_stats["mean_ab"] - base_stats["mean_ab"]
+    distance_ab = torch.linalg.vector_norm(delta_ab, dim=1)
+    hue_cosine = (ref_stats["hue_unit"] * base_stats["hue_unit"]).sum(dim=1).clamp(-1, 1)
+    hue_distance_deg = torch.rad2deg(torch.acos(hue_cosine))
+    hue_reliability = torch.minimum(
+        ref_stats["hue_validity"], base_stats["hue_validity"]
+    )
+    chroma_distance = (
+        ref_stats["median_chroma"] - base_stats["median_chroma"]
+    ).abs()
+    distribution_distance = (
+        torch.linalg.vector_norm(ref_stats["std_ab"] - base_stats["std_ab"], dim=1)
+        + 0.5 * (ref_stats["c_q25"] - base_stats["c_q25"]).abs()
+        + 0.5 * (ref_stats["c_q75"] - base_stats["c_q75"]).abs()
+    )
+    return {
+        "delta_ab": delta_ab,
+        "distance_ab": distance_ab,
+        "hue_cosine": hue_cosine,
+        "hue_distance_deg": hue_distance_deg,
+        "hue_reliability": hue_reliability,
+        "chroma_distance": chroma_distance,
+        "distribution_distance": distribution_distance,
+    }
+
+
+def compute_composite_color_gate(
+    distances: dict[str, torch.Tensor],
+    config: ColorConditionConfigV8 | None = None,
+) -> dict[str, torch.Tensor]:
+    config = config or ColorConditionConfigV8()
+    g_ab = _smoothstep(
+        distances["distance_ab"], config.ab_no_edit_threshold, config.ab_full_edit_threshold
+    )
+    g_hue = _smoothstep(
+        distances["hue_distance_deg"], config.hue_no_edit_deg, config.hue_full_edit_deg
+    ) * distances["hue_reliability"]
+    g_chroma = _smoothstep(
+        distances["chroma_distance"], config.chroma_mag_no_edit, config.chroma_mag_full_edit
+    )
+    g_distribution = _smoothstep(
+        distances["distribution_distance"],
+        config.color_dist_no_edit,
+        config.color_dist_full_edit,
+    )
+    chroma_gate = 1.0 - (1.0 - g_ab) * (1.0 - g_hue) * (1.0 - g_chroma) * (
+        1.0 - g_distribution
+    )
+    return {
+        "chroma_need_gate": chroma_gate.clamp(0, 1),
+        "gate_ab": g_ab,
+        "gate_hue": g_hue,
+        "gate_chroma": g_chroma,
+        "gate_distribution": g_distribution,
+    }
+
+
+def compute_reference_fidelity_metrics(
+    candidate_lab: torch.Tensor,
+    candidate_mask: torch.Tensor,
+    ref_stats: dict[str, torch.Tensor],
+    config: ColorConditionConfigV8 | None = None,
+) -> dict[str, torch.Tensor]:
+    candidate_stats = compute_intrinsic_hair_color_stats(candidate_lab, candidate_mask, config)
+    hue_cosine = (
+        candidate_stats["hue_unit"] * ref_stats["hue_unit"]
+    ).sum(dim=1).clamp(-1, 1)
+    hue_reliability = torch.minimum(
+        candidate_stats["hue_validity"], ref_stats["hue_validity"]
+    )
+    return {
+        "mean_ab_error": torch.linalg.vector_norm(
+            candidate_stats["mean_ab"] - ref_stats["mean_ab"], dim=1
+        ),
+        "hue_error": torch.rad2deg(torch.acos(hue_cosine)) * hue_reliability,
+        "chroma_error": (
+            candidate_stats["median_chroma"] - ref_stats["median_chroma"]
+        ).abs(),
+        "median_l_error": (
+            candidate_stats["l_median"] - ref_stats["l_median"]
+        ).abs(),
+        "candidate_stats": candidate_stats,
+    }
+
+
+def reference_color_score(metrics: dict[str, torch.Tensor]) -> torch.Tensor:
+    return (
+        metrics["mean_ab_error"]
+        + 0.10 * metrics["hue_error"]
+        + 0.50 * metrics["chroma_error"]
+    )
+
+
+def correction_hue_regression_loss(
+    anchor_hue_error: torch.Tensor,
+    final_hue_error: torch.Tensor,
+    tolerance_deg: float = 1.5,
+) -> torch.Tensor:
+    return torch.relu(final_hue_error - anchor_hue_error - float(tolerance_deg)).mean()
+
+
+def correction_reference_regression_loss(
+    anchor_metrics: dict[str, torch.Tensor],
+    final_metrics: dict[str, torch.Tensor],
+    tolerance: float = 0.2,
+) -> torch.Tensor:
+    return torch.relu(
+        reference_color_score(final_metrics)
+        - reference_color_score(anchor_metrics)
+        - float(tolerance)
+    ).mean()
+
+
+def compute_soft_l_shift(delta_l_unclamped: torch.Tensor, max_global_l_shift: float = 40.0) -> torch.Tensor:
+    """Bound a global lightness correction smoothly without a hard +/-20 cap."""
+    max_shift = max(float(max_global_l_shift), 1e-4)
+    return max_shift * torch.tanh(delta_l_unclamped / max_shift)
 
 
 def _masked_gaussian_mean(value: torch.Tensor, mask: torch.Tensor, radius: int) -> torch.Tensor:
@@ -222,126 +402,147 @@ def _smoothstep(value: torch.Tensor, lower: float, upper: float) -> torch.Tensor
 
 
 def compute_color_need_gates(
-    ref_mean_ab: torch.Tensor,
-    base_mean_ab: torch.Tensor,
+    ref_stats: dict[str, torch.Tensor],
+    base_stats: dict[str, torch.Tensor],
     delta_l_global: torch.Tensor,
     config: ColorConditionConfigV8 | None = None,
 ) -> dict[str, torch.Tensor]:
     config = config or ColorConditionConfigV8()
-    delta_ab = ref_mean_ab - base_mean_ab
-    distance_ab = torch.linalg.vector_norm(delta_ab, dim=1)
-    chroma_need_gate = _smoothstep(
-        distance_ab,
-        config.chroma_no_edit_threshold,
-        config.chroma_full_edit_threshold,
-    )
+    distances = compute_composite_color_distance(ref_stats, base_stats)
+    gate_parts = compute_composite_color_gate(distances, config)
     lightness_need_gate = _smoothstep(
         delta_l_global.abs(),
         config.lightness_no_edit_threshold,
         config.lightness_full_edit_threshold,
     )
+    chroma_need_gate = gate_parts["chroma_need_gate"]
     edit_need_gate = 1.0 - (1.0 - chroma_need_gate) * (1.0 - lightness_need_gate)
     return {
+        **distances,
+        **gate_parts,
         "chroma_need_gate": chroma_need_gate,
         "lightness_need_gate": lightness_need_gate,
         "edit_need_gate": edit_need_gate,
-        "delta_ab": delta_ab,
-        "distance_ab": distance_ab,
     }
 
 
 def compute_color_descriptor(
-    reference_lab: torch.Tensor,
-    safe_ref_mask: torch.Tensor,
-    base_lab: torch.Tensor,
-    target_hair_mask: torch.Tensor,
+    ref_stats: dict[str, torch.Tensor],
+    base_stats: dict[str, torch.Tensor],
+    gate_info: dict[str, torch.Tensor],
+    delta_l_global: torch.Tensor,
+    delta_l_unclamped: torch.Tensor,
     safe_fraction: torch.Tensor,
-    config: ColorConditionConfigV8 | None = None,
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    config = config or ColorConditionConfigV8()
-    ref_ab_stats = masked_robust_stats(reference_lab[:, 1:3], safe_ref_mask)
-    ref_l_stats = masked_robust_stats(reference_lab[:, 0:1], safe_ref_mask)
-    ref_c_stats = masked_robust_stats(
-        torch.linalg.vector_norm(reference_lab[:, 1:3], dim=1, keepdim=True),
-        safe_ref_mask,
-    )
-    base_ab_stats = masked_robust_stats(base_lab[:, 1:3], target_hair_mask)
-    base_l_stats = masked_robust_stats(base_lab[:, 0:1], target_hair_mask)
-    base_c_stats = masked_robust_stats(
-        torch.linalg.vector_norm(base_lab[:, 1:3], dim=1, keepdim=True),
-        target_hair_mask,
-    )
-
-    ref_ab = ref_ab_stats["mean"]
-    base_ab = base_ab_stats["mean"]
-    ref_c = ref_c_stats["mean"].squeeze(1)
-    base_c = base_c_stats["mean"].squeeze(1)
-    ref_l = ref_l_stats["median"].squeeze(1)
-    base_l = base_l_stats["median"].squeeze(1)
-    delta_l_unclamped = ref_l - base_l
-    delta_l = delta_l_unclamped.clamp(-config.max_global_l_shift, config.max_global_l_shift)
-    gate_info = compute_color_need_gates(ref_ab, base_ab, delta_l, config)
-
-    ref_hue = ref_ab / torch.linalg.vector_norm(ref_ab, dim=1, keepdim=True).clamp_min(1e-4)
-    base_hue = base_ab / torch.linalg.vector_norm(base_ab, dim=1, keepdim=True).clamp_min(1e-4)
-    delta_ab = gate_info["delta_ab"]
+    relative_luma_reliability: torch.Tensor,
+    pseudo_reference_fidelity: torch.Tensor,
+) -> torch.Tensor:
     descriptor = torch.cat(
         [
-            ref_ab / 110.0,
-            (ref_c / 110.0).unsqueeze(1),
-            (ref_l / 100.0).unsqueeze(1),
-            ref_hue,
-            ref_ab_stats["std"] / 110.0,
-            base_ab / 110.0,
-            (base_c / 110.0).unsqueeze(1),
-            (base_l / 100.0).unsqueeze(1),
-            base_hue,
-            delta_ab / 110.0,
-            ((ref_c - base_c) / 110.0).unsqueeze(1),
-            (delta_l / 100.0).unsqueeze(1),
-            (gate_info["distance_ab"] / 110.0).unsqueeze(1),
+            ref_stats["mean_ab"] / 110.0,
+            ref_stats["median_ab"] / 110.0,
+            (ref_stats["mean_chroma"] / 110.0).unsqueeze(1),
+            (ref_stats["median_chroma"] / 110.0).unsqueeze(1),
+            (ref_stats["l_median"] / 100.0).unsqueeze(1),
+            ref_stats["hue_unit"],
+            ref_stats["std_ab"] / 110.0,
+            (ref_stats["c_q25"] / 110.0).unsqueeze(1),
+            (ref_stats["c_q75"] / 110.0).unsqueeze(1),
+            base_stats["mean_ab"] / 110.0,
+            base_stats["median_ab"] / 110.0,
+            (base_stats["mean_chroma"] / 110.0).unsqueeze(1),
+            (base_stats["median_chroma"] / 110.0).unsqueeze(1),
+            (base_stats["l_median"] / 100.0).unsqueeze(1),
+            base_stats["hue_unit"],
+            base_stats["std_ab"] / 110.0,
+            (base_stats["c_q25"] / 110.0).unsqueeze(1),
+            (base_stats["c_q75"] / 110.0).unsqueeze(1),
+            gate_info["delta_ab"] / 110.0,
+            gate_info["hue_cosine"].unsqueeze(1),
+            (gate_info["hue_distance_deg"] / 180.0).unsqueeze(1),
+            ((ref_stats["median_chroma"] - base_stats["median_chroma"]) / 110.0).unsqueeze(1),
+            ((ref_stats["c_q25"] - base_stats["c_q25"]) / 110.0).unsqueeze(1),
+            ((ref_stats["c_q75"] - base_stats["c_q75"]) / 110.0).unsqueeze(1),
+            (gate_info["distribution_distance"] / 110.0).unsqueeze(1),
+            (delta_l_global / 100.0).unsqueeze(1),
+            (delta_l_unclamped / 100.0).unsqueeze(1),
+            relative_luma_reliability.unsqueeze(1),
+            pseudo_reference_fidelity.unsqueeze(1),
             safe_fraction.unsqueeze(1),
+            gate_info["chroma_need_gate"].unsqueeze(1),
+            gate_info["lightness_need_gate"].unsqueeze(1),
         ],
         dim=1,
     )
     if descriptor.size(1) != COLOR_DESCRIPTOR_DIM:
         raise RuntimeError(f"Expected descriptor dim={COLOR_DESCRIPTOR_DIM}, got {descriptor.size(1)}")
 
-    metrics = {
-        "ref_mean_ab": ref_ab,
-        "base_mean_ab": base_ab,
-        "ref_median_l": ref_l,
-        "base_median_l": base_l,
-        "delta_l_global": delta_l,
-        "delta_l_unclamped": delta_l_unclamped,
-        "ref_base_ab_distance": gate_info["distance_ab"],
-        "ref_base_global_l_distance": delta_l.abs(),
-        "chroma_need_gate": gate_info["chroma_need_gate"],
-        "lightness_need_gate": gate_info["lightness_need_gate"],
-        "edit_need_gate": gate_info["edit_need_gate"],
-    }
-    return descriptor, metrics
+    return descriptor
 
 
-def conditional_ab_by_luma(
-    target_luma_norm: torch.Tensor,
-    ref_luma_norm: torch.Tensor,
+def relative_luma_conditional_ab(
+    target_luma: torch.Tensor,
+    ref_luma: torch.Tensor,
     ref_ab: torch.Tensor,
     ref_mask: torch.Tensor,
-    bins: int = 9,
-) -> torch.Tensor:
-    bins = max(int(bins), 3)
-    centers = torch.linspace(0.0, 1.0, bins, device=ref_ab.device, dtype=ref_ab.dtype).view(1, bins, 1, 1)
-    sigma = 0.55 / max(bins - 1, 1)
+    target_mask: torch.Tensor,
+    ref_stats: dict[str, torch.Tensor],
+    base_stats: dict[str, torch.Tensor],
+    config: ColorConditionConfigV8 | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    config = config or ColorConditionConfigV8()
+    bins = max(int(config.relative_luma_bins), 3)
+    centers = torch.linspace(-2.5, 2.5, bins, device=ref_ab.device, dtype=ref_ab.dtype).view(
+        1, bins, 1, 1
+    )
+    sigma = 3.0 / max(bins - 1, 1)
     ref_mask = _as_mask4d(ref_mask, ref_ab.shape[-2:], ref_ab.size(0))
-    ref_weights = torch.exp(-0.5 * ((ref_luma_norm - centers) / sigma).square()) * ref_mask
+    target_mask = _as_mask4d(target_mask, target_luma.shape[-2:], target_luma.size(0))
+    ref_scale = (
+        0.7413 * (ref_stats["l_q75"] - ref_stats["l_q25"])
+    ).clamp_min(config.relative_luma_min_scale)
+    base_scale = (
+        0.7413 * (base_stats["l_q75"] - base_stats["l_q25"])
+    ).clamp_min(config.relative_luma_min_scale)
+    ref_z = (ref_luma - ref_stats["l_median"][:, None, None, None]) / ref_scale[
+        :, None, None, None
+    ]
+    target_z = (target_luma - base_stats["l_median"][:, None, None, None]) / base_scale[
+        :, None, None, None
+    ]
+    ref_weights = torch.exp(-0.5 * ((ref_z - centers) / sigma).square()) * ref_mask
     ref_weights_5d = ref_weights.unsqueeze(2)
-    denominator = ref_weights_5d.sum(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+    denominator_raw = ref_weights_5d.sum(dim=(-2, -1), keepdim=True)
+    denominator = denominator_raw.clamp_min(1e-6)
     bin_ab = (ref_ab.unsqueeze(1) * ref_weights_5d).sum(dim=(-2, -1), keepdim=True) / denominator
-    global_ab = masked_robust_stats(ref_ab, ref_mask)["mean"][:, None, :, None, None]
-    bin_ab = torch.where(denominator > 8.0, bin_ab, global_ab)
-    target_weights = torch.exp(-0.5 * ((target_luma_norm - centers) / sigma).square()).unsqueeze(2)
-    return (bin_ab * target_weights).sum(dim=1) / target_weights.sum(dim=1).clamp_min(1e-6)
+    global_ab_value = 0.5 * (ref_stats["mean_ab"] + ref_stats["median_ab"])
+    global_ab = global_ab_value[:, None, :, None, None]
+    valid_bins = (denominator_raw > 8.0).to(ref_ab.dtype)
+    bin_ab = torch.where(valid_bins.bool(), bin_ab, global_ab)
+    target_weights = torch.exp(-0.5 * ((target_z - centers) / sigma).square()).unsqueeze(2)
+    target_weight_sum = target_weights.sum(dim=1).clamp_min(1e-6)
+    conditional_ab = (bin_ab * target_weights).sum(dim=1) / target_weight_sum
+    bin_reliability = (valid_bins * target_weights).sum(dim=1) / target_weight_sum
+    ref_z_q05 = _weighted_quantile(ref_z, ref_mask, 0.05)[:, :, None, None]
+    ref_z_q95 = _weighted_quantile(ref_z, ref_mask, 0.95)[:, :, None, None]
+    coverage = torch.sigmoid((target_z - ref_z_q05) / 0.25) * torch.sigmoid(
+        (ref_z_q95 - target_z) / 0.25
+    )
+    reliability_map = (bin_reliability * coverage).clamp(0, 1)
+    reliability = (
+        (reliability_map * target_mask).sum(dim=(-2, -1))
+        / target_mask.sum(dim=(-2, -1)).clamp_min(1.0)
+    ).squeeze(1)
+    fallback_threshold = max(config.global_ab_fallback_min_reliability, 1e-4)
+    sample_conditional_weight = (reliability / fallback_threshold).clamp(0, 1)
+    effective_reliability_map = (
+        reliability_map * sample_conditional_weight[:, None, None, None]
+    )
+    fallback_ab = global_ab_value[:, :, None, None]
+    target_ref_ab = (
+        effective_reliability_map * conditional_ab
+        + (1.0 - effective_reliability_map) * fallback_ab
+    )
+    return target_ref_ab, reliability, effective_reliability_map
 
 
 def build_pseudo_color_target(
@@ -350,25 +551,57 @@ def build_pseudo_color_target(
     base_lab: torch.Tensor,
     target_hair_mask: torch.Tensor,
     delta_l_global: torch.Tensor,
+    ref_stats: dict[str, torch.Tensor],
+    base_stats: dict[str, torch.Tensor],
     config: ColorConditionConfigV8 | None = None,
 ) -> dict[str, torch.Tensor]:
     config = config or ColorConditionConfigV8()
     target_hair_mask = _as_mask4d(target_hair_mask, base_lab.shape[-2:], base_lab.size(0))
-    target_ref_ab = conditional_ab_by_luma(
-        target_luma_norm=(base_lab[:, 0:1] / 100.0).clamp(0, 1),
-        ref_luma_norm=(reference_lab[:, 0:1] / 100.0).clamp(0, 1),
+    target_ref_ab, relative_reliability, reliability_map = relative_luma_conditional_ab(
+        target_luma=base_lab[:, 0:1],
+        ref_luma=reference_lab[:, 0:1],
         ref_ab=reference_lab[:, 1:3],
         ref_mask=safe_ref_mask,
-        bins=config.conditional_luma_bins,
+        target_mask=target_hair_mask,
+        ref_stats=ref_stats,
+        base_stats=base_stats,
+        config=config,
     )
     delta_l = delta_l_global[:, None, None, None]
-    pseudo_ab = base_lab[:, 1:3] + target_hair_mask * (target_ref_ab - base_lab[:, 1:3])
+    candidate_ab = base_lab[:, 1:3] + target_hair_mask * (target_ref_ab - base_lab[:, 1:3])
     pseudo_l = base_lab[:, 0:1] + target_hair_mask * delta_l
+    candidate_lab = torch.cat([pseudo_l.clamp(0, 100), candidate_ab], dim=1)
+    candidate_fidelity = compute_reference_fidelity_metrics(
+        candidate_lab, target_hair_mask, ref_stats, config
+    )
+    analytic_fidelity = torch.exp(
+        -candidate_fidelity["mean_ab_error"] / max(config.pseudo_fidelity_ab_bad, 1e-4)
+        -candidate_fidelity["hue_error"] / max(config.pseudo_fidelity_hue_bad, 1e-4)
+    ).detach().clamp(0, 1)
+    global_ab = 0.5 * (ref_stats["mean_ab"] + ref_stats["median_ab"])
+    guarded_target_ab = (
+        analytic_fidelity[:, None, None, None] * target_ref_ab
+        + (1.0 - analytic_fidelity[:, None, None, None]) * global_ab[:, :, None, None]
+    )
+    pseudo_ab = base_lab[:, 1:3] + target_hair_mask * (
+        guarded_target_ab - base_lab[:, 1:3]
+    )
     pseudo_lab = torch.cat([pseudo_l.clamp(0, 100), pseudo_ab], dim=1)
+    final_fidelity = compute_reference_fidelity_metrics(
+        pseudo_lab, target_hair_mask, ref_stats, config
+    )
+    pseudo_reference_fidelity = torch.exp(
+        -final_fidelity["mean_ab_error"] / max(config.pseudo_fidelity_ab_bad, 1e-4)
+        -final_fidelity["hue_error"] / max(config.pseudo_fidelity_hue_bad, 1e-4)
+    ).clamp(0, 1)
     return {
         "pseudo_lab": pseudo_lab,
         "pseudo_rgb01": lab_to_rgb(pseudo_lab),
-        "target_ref_ab": target_ref_ab,
+        "target_ref_ab": guarded_target_ab,
+        "relative_luma_reliability": relative_reliability,
+        "relative_luma_reliability_map": reliability_map,
+        "pseudo_reference_fidelity": pseudo_reference_fidelity,
+        "fidelity_metrics": final_fidelity,
     }
 
 
@@ -419,21 +652,32 @@ def build_color_condition_bundle(
     base_rgb01, base_normalized = _to_rgb01(base_image)
     base_lab = rgb_to_lab(base_rgb01)
     target_hair_mask = _as_mask4d(target_hair_mask, base_lab.shape[-2:], base_lab.size(0))
-    descriptor, metrics = compute_color_descriptor(
-        reference_lab=safe_info["reference_lab"],
-        safe_ref_mask=safe_info["safe_ref_mask"],
-        base_lab=base_lab,
-        target_hair_mask=target_hair_mask,
-        safe_fraction=safe_info["safe_fraction"],
-        config=config,
+    ref_stats = compute_intrinsic_hair_color_stats(
+        safe_info["reference_lab"], safe_info["safe_ref_mask"], config
     )
+    base_stats = compute_intrinsic_hair_color_stats(base_lab, target_hair_mask, config)
+    delta_l_unclamped = ref_stats["l_median"] - base_stats["l_median"]
+    delta_l_global = compute_soft_l_shift(delta_l_unclamped, config.max_global_l_shift)
+    gate_info = compute_color_need_gates(ref_stats, base_stats, delta_l_global, config)
     pseudo = build_pseudo_color_target(
         reference_lab=safe_info["reference_lab"],
         safe_ref_mask=safe_info["safe_ref_mask"],
         base_lab=base_lab,
         target_hair_mask=target_hair_mask,
-        delta_l_global=metrics["delta_l_global"],
+        delta_l_global=delta_l_global,
+        ref_stats=ref_stats,
+        base_stats=base_stats,
         config=config,
+    )
+    descriptor = compute_color_descriptor(
+        ref_stats=ref_stats,
+        base_stats=base_stats,
+        gate_info=gate_info,
+        delta_l_global=delta_l_global,
+        delta_l_unclamped=delta_l_unclamped,
+        safe_fraction=safe_info["safe_fraction"],
+        relative_luma_reliability=pseudo["relative_luma_reliability"],
+        pseudo_reference_fidelity=pseudo["pseudo_reference_fidelity"],
     )
     color_proxy = build_reference_color_proxy(
         reference_image,
@@ -441,8 +685,34 @@ def build_color_condition_bundle(
         safe_info["reference_lab"],
         safe_info["safe_ref_mask"],
     )
+    composite_color_distance = (
+        gate_info["distance_ab"]
+        + 0.10 * gate_info["hue_distance_deg"] * gate_info["hue_reliability"]
+        + 0.50 * gate_info["chroma_distance"]
+        + gate_info["distribution_distance"]
+    )
     metrics = {
-        **metrics,
+        "ref_mean_ab": ref_stats["mean_ab"],
+        "base_mean_ab": base_stats["mean_ab"],
+        "ref_median_l": ref_stats["l_median"],
+        "base_median_l": base_stats["l_median"],
+        "delta_l_global": delta_l_global,
+        "delta_l_unclamped": delta_l_unclamped,
+        "ref_base_ab_distance": gate_info["distance_ab"],
+        "ref_base_global_l_distance": delta_l_global.abs(),
+        "composite_color_distance": composite_color_distance,
+        "hue_distance_deg": gate_info["hue_distance_deg"],
+        "chroma_distance": gate_info["chroma_distance"],
+        "distribution_distance": gate_info["distribution_distance"],
+        "relative_luma_reliability": pseudo["relative_luma_reliability"],
+        "pseudo_reference_fidelity": pseudo["pseudo_reference_fidelity"],
+        "pseudo_to_reference_mean_ab": pseudo["fidelity_metrics"]["mean_ab_error"],
+        "pseudo_to_reference_hue_error": pseudo["fidelity_metrics"]["hue_error"],
+        "pseudo_to_reference_chroma_error": pseudo["fidelity_metrics"]["chroma_error"],
+        "pseudo_to_reference_median_l_error": pseudo["fidelity_metrics"]["median_l_error"],
+        "chroma_need_gate": gate_info["chroma_need_gate"],
+        "lightness_need_gate": gate_info["lightness_need_gate"],
+        "edit_need_gate": gate_info["edit_need_gate"],
         "safe_fraction": safe_info["safe_fraction"],
         "raw_safe_fraction": safe_info["raw_safe_fraction"],
         "rejected_fraction": 1.0 - safe_info["safe_fraction"],
@@ -458,6 +728,15 @@ def build_color_condition_bundle(
         "pseudo_rgb": _from_rgb01(pseudo["pseudo_rgb01"], base_normalized),
         "color_proxy": color_proxy,
         "target_ref_ab": pseudo["target_ref_ab"],
+        "relative_luma_reliability": pseudo["relative_luma_reliability"],
+        "relative_luma_reliability_map": pseudo["relative_luma_reliability_map"],
+        "pseudo_reference_fidelity": pseudo["pseudo_reference_fidelity"],
+        "ref_stats": ref_stats,
+        "base_stats": base_stats,
+        "composite_color_distance": composite_color_distance,
+        "hue_distance_deg": gate_info["hue_distance_deg"],
+        "chroma_distance": gate_info["chroma_distance"],
+        "distribution_distance": gate_info["distribution_distance"],
         "base_lab": base_lab,
         "metrics": metrics,
     }

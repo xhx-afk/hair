@@ -104,11 +104,11 @@ class ClipBlendingModel(nn.Module):
         return output
 
 
-DIRECT_COLOR_ARCH_V8_3 = "direct_color_anchor_v8_3"
+DIRECT_COLOR_ARCH_V8_4 = "direct_color_anchor_v8_4"
 
 
 def load_direct_color_adapter_state_v8(module, state_dict):
-    """Strictly load every V8.3 adapter tensor except the frozen CLIP weights."""
+    """Strictly load every V8.4 adapter tensor except the frozen CLIP weights."""
     incompatible = module.load_state_dict(state_dict, strict=False)
     invalid_missing = [
         key for key in incompatible.missing_keys
@@ -116,7 +116,7 @@ def load_direct_color_adapter_state_v8(module, state_dict):
     ]
     if invalid_missing or incompatible.unexpected_keys:
         raise RuntimeError(
-            "Invalid direct_color_anchor_v8_3 state_dict: "
+            "Invalid direct_color_anchor_v8_4 state_dict: "
             f"missing_non_clip={invalid_missing}, "
             f"unexpected={list(incompatible.unexpected_keys)}"
         )
@@ -131,11 +131,8 @@ class DirectColorBlendAdapterV8(nn.Module):
         self,
         clip_model="ViT-B/32",
         descriptor_dim=COLOR_DESCRIPTOR_DIM,
-        direct_mix_init=0.70,
-        direct_mix_floor_low=0.10,
-        direct_mix_floor_high=0.60,
-        direct_mix_mode="learned_retained",
-        direct_mix_fixed=0.70,
+        alpha_init=0.70,
+        layer_offset_max=0.15,
         correction_chroma_budget_ratio=0.15,
         correction_luma_budget_ratio=0.10,
         correction_orth_scale=0.25,
@@ -162,7 +159,12 @@ class DirectColorBlendAdapterV8(nn.Module):
             nn.LayerNorm(descriptor_hidden),
             nn.LeakyReLU(),
         )
-        self.layer_mix_head = nn.Linear(descriptor_hidden, 12)
+        self.strength_head = nn.Sequential(
+            nn.Linear(descriptor_hidden, 64),
+            nn.LeakyReLU(),
+            nn.Linear(64, 1),
+        )
+        self.layer_offset_head = nn.Linear(descriptor_hidden, 12)
         self.layer_embedding = nn.Embedding(12, layer_embed_dim)
         correction_input_dim = 512 + 512 + descriptor_hidden + layer_embed_dim + 3
         self.correction_mlp = nn.Sequential(
@@ -174,31 +176,26 @@ class DirectColorBlendAdapterV8(nn.Module):
             nn.LeakyReLU(),
             nn.Linear(correction_hidden, 512),
         )
-        if not 0.0 < direct_mix_init < 1.0:
-            raise ValueError("direct_mix_init must be strictly between 0 and 1")
-        if not 0.0 <= direct_mix_floor_low <= direct_mix_floor_high <= 1.0:
-            raise ValueError("direct mix floors must satisfy 0 <= low <= high <= 1")
-        if direct_mix_mode not in {"fixed", "learned_retained"}:
-            raise ValueError("direct_mix_mode must be 'fixed' or 'learned_retained'")
-        if not 0.0 <= direct_mix_fixed <= 1.0:
-            raise ValueError("direct_mix_fixed must be in [0,1]")
+        if not 0.0 < alpha_init < 1.0:
+            raise ValueError("alpha_init must be strictly between 0 and 1")
+        if not 0.0 <= layer_offset_max <= 1.0:
+            raise ValueError("layer_offset_max must be in [0,1]")
         if correction_chroma_budget_ratio < 0.0 or correction_luma_budget_ratio < 0.0:
             raise ValueError("correction budget ratios must be non-negative")
         if not 0.0 <= correction_orth_scale <= 1.0:
             raise ValueError("correction_orth_scale must be in [0,1]")
-        self.direct_mix_init = float(direct_mix_init)
-        self.direct_mix_floor_low = float(direct_mix_floor_low)
-        self.direct_mix_floor_high = float(direct_mix_floor_high)
-        self.direct_mix_mode = direct_mix_mode
-        self.direct_mix_fixed = float(direct_mix_fixed)
+        self.alpha_init = float(alpha_init)
+        self.layer_offset_max = float(layer_offset_max)
         self.correction_chroma_budget_ratio = float(correction_chroma_budget_ratio)
         self.correction_luma_budget_ratio = float(correction_luma_budget_ratio)
         self.correction_orth_scale = float(correction_orth_scale)
         self.anchor_frozen = False
 
-        nn.init.zeros_(self.layer_mix_head.weight)
-        init_logit = torch.logit(torch.tensor(self.direct_mix_init)).item()
-        nn.init.constant_(self.layer_mix_head.bias, init_logit)
+        nn.init.zeros_(self.strength_head[-1].weight)
+        init_logit = torch.logit(torch.tensor(self.alpha_init)).item()
+        nn.init.constant_(self.strength_head[-1].bias, init_logit)
+        nn.init.zeros_(self.layer_offset_head.weight)
+        nn.init.zeros_(self.layer_offset_head.bias)
         nn.init.zeros_(self.correction_mlp[-1].weight)
         nn.init.zeros_(self.correction_mlp[-1].bias)
 
@@ -223,13 +220,13 @@ class DirectColorBlendAdapterV8(nn.Module):
                 parameter.requires_grad = bool(enabled)
 
     def set_anchor_trainable(self, enabled):
-        for module in (self.descriptor_encoder, self.layer_mix_head):
+        for module in (self.descriptor_encoder, self.strength_head, self.layer_offset_head):
             for parameter in module.parameters():
                 parameter.requires_grad = bool(enabled)
         self.anchor_frozen = not bool(enabled)
 
     def anchor_parameters(self):
-        for module in (self.descriptor_encoder, self.layer_mix_head):
+        for module in (self.descriptor_encoder, self.strength_head, self.layer_offset_head):
             yield from module.parameters()
 
     def correction_parameters(self):
@@ -257,6 +254,8 @@ class DirectColorBlendAdapterV8(nn.Module):
         edit_need_gate,
         correction_enabled=True,
         layer_mix_override=None,
+        teacher_alpha=None,
+        reference_color_score=None,
         return_aux=False,
     ):
         if latent_face.shape != latent_color.shape or latent_face.shape[1:] != (12, 512):
@@ -283,20 +282,19 @@ class DirectColorBlendAdapterV8(nn.Module):
         if not torch.isfinite(color_descriptor).all():
             raise ValueError("color_descriptor contains NaN or Inf")
         descriptor_feature = self.descriptor_encoder(color_descriptor.float()).to(latent_face.dtype)
-        learned_mix = torch.sigmoid(self.layer_mix_head(descriptor_feature)).unsqueeze(-1)
-        dynamic_floor = self.direct_mix_floor_low + chroma_gate * (
-            self.direct_mix_floor_high - self.direct_mix_floor_low
+        predicted_alpha = torch.sigmoid(self.strength_head(descriptor_feature)).flatten()
+        layer_offset = self.layer_offset_max * torch.tanh(
+            self.layer_offset_head(descriptor_feature)
         )
-        if self.direct_mix_mode == "fixed":
-            layer_mix = learned_mix * 0.0 + self.direct_mix_fixed
-        else:
-            layer_mix = torch.maximum(learned_mix, dynamic_floor)
+        layer_mix = (
+            predicted_alpha[:, None, None] + layer_offset[:, :, None]
+        ).clamp(0, 1)
         if layer_mix_override is not None:
             layer_mix = self._layer_mix_override(
                 layer_mix_override, batch, latent_face.device, latent_face.dtype
             )
         direct_delta = latent_color - latent_face
-        direct_component = chroma_gate * layer_mix * direct_delta
+        direct_component = layer_mix * direct_delta
 
         if correction_enabled:
             source_normalized = self.pixelnorm(latent_face)
@@ -363,6 +361,16 @@ class DirectColorBlendAdapterV8(nn.Module):
             return output
         correction_norm = torch.linalg.vector_norm(correction.flatten(1), dim=1)
         total_delta_norm = torch.linalg.vector_norm((output - latent_face).flatten(1), dim=1)
+        teacher_alpha_aux = torch.full_like(predicted_alpha, float("nan"))
+        if teacher_alpha is not None:
+            teacher_alpha_aux = torch.as_tensor(
+                teacher_alpha, device=latent_face.device, dtype=latent_face.dtype
+            ).reshape(batch)
+        reference_color_score_aux = torch.full_like(predicted_alpha, float("nan"))
+        if reference_color_score is not None:
+            reference_color_score_aux = torch.as_tensor(
+                reference_color_score, device=latent_face.device, dtype=latent_face.dtype
+            ).reshape(batch)
         return output, {
             "direct_delta": direct_delta,
             "direct_component": direct_component,
@@ -377,6 +385,11 @@ class DirectColorBlendAdapterV8(nn.Module):
             "correction_luma_budget": luma_budget,
             "correction_budget_scale": correction_budget_scale,
             "layer_mix": layer_mix,
+            "effective_layer_mix": layer_mix,
+            "predicted_alpha": predicted_alpha,
+            "layer_offset": layer_offset,
+            "teacher_alpha": teacher_alpha_aux,
+            "reference_color_score": reference_color_score_aux,
             "layer_mix_mean": layer_mix.mean(dim=(1, 2)),
             "layer_mix_min": layer_mix.amin(dim=(1, 2)),
             "layer_mix_max": layer_mix.amax(dim=(1, 2)),

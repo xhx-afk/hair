@@ -5,12 +5,7 @@ from v8_adapter_test_utils import build_adapter, run_adapter, synthetic_inputs
 
 def main():
     torch.manual_seed(22)
-    high_floor = 0.60
-    model = build_adapter(
-        direct_mix_init=0.70,
-        direct_mix_floor_low=0.10,
-        direct_mix_floor_high=high_floor,
-    )
+    model = build_adapter(alpha_init=0.70, layer_offset_max=0.15)
     model.set_anchor_trainable(True)
     model.set_correction_trainable(False)
     optimizer = torch.optim.Adam(list(model.anchor_parameters()), lr=5e-2)
@@ -31,7 +26,12 @@ def main():
     del initial_output
     assert torch.allclose(initial_aux["layer_mix"], torch.full_like(initial_aux["layer_mix"], 0.70))
 
-    for _ in range(40):
+    with torch.no_grad():
+        # Move off the intentional constant initializer before teacher supervision.
+        model.strength_head[-1].weight.normal_(mean=0.0, std=0.25)
+
+    target_alpha = torch.tensor([0.05, 0.25, 0.85, 0.98])
+    for _ in range(80):
         optimizer.zero_grad(set_to_none=True)
         _, aux = run_adapter(
             model,
@@ -43,7 +43,7 @@ def main():
             ones,
             correction_enabled=False,
         )
-        aux["layer_mix"].mean().backward()
+        torch.nn.functional.smooth_l1_loss(aux["predicted_alpha"], target_alpha).backward()
         optimizer.step()
 
     _, final_aux = run_adapter(
@@ -56,9 +56,10 @@ def main():
         ones,
         correction_enabled=False,
     )
-    minimum_mix = float(final_aux["layer_mix"].min())
-    assert minimum_mix >= high_floor
-    print(f"v8 direct mix collapse test passed: minimum_high_chroma_mix={minimum_mix:.6f}")
+    predicted = final_aux["predicted_alpha"]
+    assert float(predicted.std()) > 1e-3
+    assert float(final_aux["layer_offset"].abs().max()) <= 0.15 + 1e-6
+    print(f"v8 adaptive strength test passed: alpha_std={float(predicted.std()):.6f}")
 
 
 if __name__ == "__main__":

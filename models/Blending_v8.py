@@ -77,6 +77,8 @@ from models.hair_local_recomposition_v838 import HairLocalRecompositionV838
 from models.v838_runtime_inputs import build_v838_runtime_inputs
 from models.hair_local_recomposition_v839 import HairLocalRecompositionV839
 from models.v839_runtime_inputs import build_v839_runtime_inputs
+from models.hair_local_recomposition_v840 import HairLocalRecompositionV840
+from models.v840_runtime_inputs import build_v840_runtime_inputs
 from utils.bicubic import BicubicDownSample
 from utils.image_utils import DilateErosion
 from utils.mask_delta_v8 import filter_parsing_to_primary_subject
@@ -197,6 +199,15 @@ class Blending_v8(Blending):
         return transfer(return_aux=True, **runtime_inputs)
 
     @staticmethod
+    def build_v240_runtime_inputs(**kwargs):
+        return build_v840_runtime_inputs(**kwargs)
+
+    @staticmethod
+    @torch.inference_mode()
+    def run_v240_appearance_debug(transfer, **runtime_inputs):
+        return transfer(return_aux=True, **runtime_inputs)
+
+    @staticmethod
     def run_v233_pipeline_debug(**kwargs):
         return run_v833_pipeline(**kwargs)
 
@@ -257,15 +268,16 @@ class Blending_v8(Blending):
         self.v228 = self.v226 and bool(getattr(self.opts, "v228_enabled", True))
         self.v229 = self.v228 and bool(getattr(self.opts, "v229_enabled", True))
         self.v230 = self.v229 and bool(getattr(self.opts, "v230_enabled", True))
-        self.v239 = self.v226 and bool(getattr(self.opts, "v239_enabled", True))
-        self.v238 = self.v226 and bool(getattr(self.opts, "v238_enabled", True)) and not self.v239
-        self.v237 = self.v226 and bool(getattr(self.opts, "v237_enabled", True)) and not self.v238 and not self.v239
-        self.v236 = self.v226 and bool(getattr(self.opts, "v236_enabled", True)) and not self.v237 and not self.v238 and not self.v239
-        self.v235 = self.v226 and bool(getattr(self.opts, "v235_enabled", True)) and not self.v236 and not self.v237 and not self.v238 and not self.v239
-        self.v234 = self.v226 and bool(getattr(self.opts, "v234_enabled", True)) and not self.v235 and not self.v236 and not self.v237 and not self.v238 and not self.v239
+        self.v240 = self.v226 and bool(getattr(self.opts, "v240_enabled", True))
+        self.v239 = self.v226 and bool(getattr(self.opts, "v239_enabled", True)) and not self.v240
+        self.v238 = self.v226 and bool(getattr(self.opts, "v238_enabled", True)) and not self.v239 and not self.v240
+        self.v237 = self.v226 and bool(getattr(self.opts, "v237_enabled", True)) and not self.v238 and not self.v239 and not self.v240
+        self.v236 = self.v226 and bool(getattr(self.opts, "v236_enabled", True)) and not self.v237 and not self.v238 and not self.v239 and not self.v240
+        self.v235 = self.v226 and bool(getattr(self.opts, "v235_enabled", True)) and not self.v236 and not self.v237 and not self.v238 and not self.v239 and not self.v240
+        self.v234 = self.v226 and bool(getattr(self.opts, "v234_enabled", True)) and not self.v235 and not self.v236 and not self.v237 and not self.v238 and not self.v239 and not self.v240
         # V2.34 is a direct carrier path. It must not initialize or call the
         # V2.31-V2.33 matting/recomposition stack when enabled.
-        self.v231 = self.v230 and bool(getattr(self.opts, "v231_enabled", True)) and not self.v234 and not self.v235 and not self.v236 and not self.v237 and not self.v238 and not self.v239
+        self.v231 = self.v230 and bool(getattr(self.opts, "v231_enabled", True)) and not self.v234 and not self.v235 and not self.v236 and not self.v237 and not self.v238 and not self.v239 and not self.v240
         self.v232 = self.v231 and bool(getattr(self.opts, "v232_enabled", True))
         self.v233 = self.v232 and bool(getattr(self.opts, "v233_enabled", True))
         self.selective_runtime = self.v222 or self.v223 or self.v224 or self.v225 or self.v226
@@ -476,6 +488,23 @@ class Blending_v8(Blending):
         self.v237_transfer = None
         self.v238_transfer = None
         self.v239_transfer = None
+        self.v240_transfer = None
+        if self.v240:
+            self.v240_transfer = HairLocalRecompositionV840(
+                palette_mad_scale=getattr(self.opts, "v240_palette_mad_scale", 3.5),
+                palette_min_support=getattr(self.opts, "v240_palette_min_support", 16),
+                illumination_radius=getattr(self.opts, "v240_illumination_radius", 11),
+                carrier_mid_radius=getattr(self.opts, "v240_carrier_mid_radius", 3),
+                mid_gain=getattr(self.opts, "v240_mid_gain", 1.0),
+                high_gain=getattr(self.opts, "v240_high_gain", 0.95),
+                chroma_mid_gain=getattr(self.opts, "v240_chroma_mid_gain", 0.35),
+                chroma_high_gain=getattr(self.opts, "v240_chroma_high_gain", 0.20),
+                contact_radius=getattr(self.opts, "v240_contact_radius", 5),
+                risk_strength=getattr(self.opts, "v240_risk_strength", 0.65),
+                matte_ring_radius=getattr(self.opts, "v240_matte_ring_radius", 5),
+                face_guard=getattr(self.opts, "v240_face_guard", 0.35),
+            )
+            print(f"[Blending_v8] V2.40 multiband recolor enabled; config={self.v240_transfer.config_dict()}")
         if self.v239:
             self.v239_transfer = HairLocalRecompositionV839(
                 palette_mad_scale=getattr(self.opts, "v239_palette_mad_scale", 3.5),
@@ -878,6 +907,7 @@ class Blending_v8(Blending):
     _blend_v237_carrier = _blend_v235_carrier
     _blend_v238_carrier = _blend_v235_carrier
     _blend_v239_carrier = _blend_v235_carrier
+    _blend_v240_carrier = _blend_v235_carrier
 
     @torch.inference_mode()
     def _blend_v234_carrier(
@@ -1084,7 +1114,7 @@ class Blending_v8(Blending):
             )
             I_base_256 = self.downsample_256(I_base)
             reference_for_condition = I_3
-            if self.v239 or self.v238 or self.v237 or self.v236 or self.v235:
+            if self.v240 or self.v239 or self.v238 or self.v237 or self.v236 or self.v235:
                 # V2.35 never feeds face/background pixels into the color
                 # condition branch; the neutral fill is not encoded as color.
                 color_mask_for_condition = F.interpolate(
@@ -1098,7 +1128,14 @@ class Blending_v8(Blending):
                 target_hair_mask=HM_XE,
                 config=self.color_config,
             )
-            if self.v239:
+            if self.v240:
+                I_anchor, I_blend_256, blending_aux = self._blend_v240_carrier(
+                    base_rgb=I_base_256, latent_face=latent_S_1, latent_color=latent_S_3,
+                    latent_f_align=latent_F_align, target_hair_mask=HM_X,
+                    target_hair_eroded=HM_XE, color_bundle=bundle,
+                )
+                S_blend = None
+            elif self.v239:
                 I_anchor, I_blend_256, blending_aux = self._blend_v239_carrier(
                     base_rgb=I_base_256, latent_face=latent_S_1, latent_color=latent_S_3,
                     latent_f_align=latent_F_align, target_hair_mask=HM_X,
@@ -1249,7 +1286,7 @@ class Blending_v8(Blending):
             I_blend_256 = self.downsample_256(I_blend)
 
         S_final = F_final = None
-        if (self.v239 or self.v238 or self.v237 or self.v236 or self.v235 or self.v234) and needs_blend:
+        if (self.v240 or self.v239 or self.v238 or self.v237 or self.v236 or self.v235 or self.v234) and needs_blend:
             # V2.34-V2.36 deliberately bypass F/B recomposition: the generated
             # Strong Anchor remains the spatial/opacity carrier.
             I_final_pp = I_anchor
@@ -1263,7 +1300,25 @@ class Blending_v8(Blending):
                 end_layer=8,
                 layer_in=F_final,
             )
-        if self.v239 and needs_blend:
+        if self.v240 and needs_blend:
+            base_rgb01 = ((I_base_256 + 1.0) / 2.0).clamp(0, 1)
+            anchor_rgb01 = ((I_anchor + 1.0) / 2.0).clamp(0, 1)
+            reference_rgb01 = ((I_3 + 1.0) / 2.0).clamp(0, 1)
+            reference_hair_hr = F.interpolate(hair_color_mask.float(), size=anchor_rgb01.shape[-2:], mode="nearest")
+            reference_rgb01 = reference_rgb01 * reference_hair_hr + 0.5 * (1.0 - reference_hair_hr)
+            target_hair_hr = F.interpolate(HM_X.float(), size=anchor_rgb01.shape[-2:], mode="bilinear", align_corners=False)
+            face_hr = F.interpolate(parser_regions_v230["source_face_mask"].float(), size=anchor_rgb01.shape[-2:], mode="bilinear", align_corners=False)
+            skin_hr = F.interpolate(parser_regions_v230["source_skin_mask"].float(), size=anchor_rgb01.shape[-2:], mode="bilinear", align_corners=False)
+            v240_runtime = build_v840_runtime_inputs(
+                base_rgb=base_rgb01, strong_anchor_rgb=anchor_rgb01,
+                color_reference_rgb=reference_rgb01, target_illumination_rgb=base_rgb01,
+                coarse_target_hair_mask=target_hair_hr, source_face_mask=face_hr,
+                source_skin_mask=skin_hr, reference_hair_mask=reference_hair_hr,
+            )
+            final_rgb01, v240_aux = self.v240_transfer(return_aux=True, **v240_runtime)
+            I_final = final_rgb01 * 2.0 - 1.0
+            blending_aux.update({"v240_runtime": v240_runtime, "v240_final_rgb": final_rgb01, **v240_aux})
+        elif self.v239 and needs_blend:
             base_rgb01 = ((I_base_256 + 1.0) / 2.0).clamp(0, 1)
             anchor_rgb01 = ((I_anchor + 1.0) / 2.0).clamp(0, 1)
             reference_rgb01 = ((I_3 + 1.0) / 2.0).clamp(0, 1)
@@ -1573,7 +1628,7 @@ class Blending_v8(Blending):
                     save_gen_image(output_dir, "Blending_v8", "strong_anchor.png", I_anchor)
                     selective_name = "selective_color_v226.png" if self.v226 else "selective_color_v225.png" if self.v225 else "selective_color_v224.png" if self.v224 else "selective_color.png"
                     save_gen_image(output_dir, "Blending_v8", selective_name, I_blend_256)
-                    if (self.v223 or self.v224 or self.v225 or self.v226) and blending_aux is not None and not (self.v234 or self.v235 or self.v236 or self.v237 or self.v238 or self.v239):
+                    if (self.v223 or self.v224 or self.v225 or self.v226) and blending_aux is not None and not (self.v234 or self.v235 or self.v236 or self.v237 or self.v238 or self.v239 or self.v240):
                         for mask_name, aux_name in (
                             ("hair_core", "hair_core"),
                             ("boundary_membership" if (self.v224 or self.v225 or self.v226) else "transition_ring", "hair_edge"),
@@ -1587,7 +1642,7 @@ class Blending_v8(Blending):
                                 f"{mask_name}.png",
                                 blending_aux[aux_name] * 2.0 - 1.0,
                             )
-                    if (self.v224 or self.v225 or self.v226) and not (self.v234 or self.v235 or self.v236 or self.v237 or self.v238 or self.v239):
+                    if (self.v224 or self.v225 or self.v226) and not (self.v234 or self.v235 or self.v236 or self.v237 or self.v238 or self.v239 or self.v240):
                             save_gen_image(
                                 output_dir, "Blending_v8", "outer_background_guard.png",
                                 blending_aux["outer_background_guard"] * 2.0 - 1.0,
@@ -1597,7 +1652,15 @@ class Blending_v8(Blending):
                         save_gen_image(output_dir, "Blending_v8", "v228_hair_alpha.png", blending_aux["hair_alpha"] * 2.0 - 1.0)
                         save_gen_image(output_dir, "Blending_v8", "v228_prepp.png", I_blend_256)
                         save_gen_image(output_dir, "Blending_v8", "pp_original.png", blending_aux["pp_original_rgb"] * 2.0 - 1.0)
-                    if self.v239:
+                    if self.v240:
+                        for name, key in (("carrier_l_mid.png", "carrier_l_mid"), ("carrier_l_high.png", "carrier_l_high"), ("mapped_l_low.png", "mapped_l_low"), ("new_hair_rgb.png", "new_hair_rgb"), ("hair_alpha_final.png", "target_hair_alpha_final"), ("face_contact_contamination_risk.png", "face_contact_contamination_risk"), ("final_leakage_map.png", "non_hair_leakage_map")):
+                            value = blending_aux[key]
+                            if value.size(1) == 2:
+                                value = torch.cat((value, torch.zeros_like(value[:, :1])), dim=1)
+                            if value.size(1) == 1:
+                                value = value.repeat(1, 3, 1, 1)
+                            save_gen_image(output_dir, "Blending_v8", name, value / 100.0 * 2.0 - 1.0 if key in ("carrier_l_mid", "carrier_l_high", "mapped_l_low") else value * 2.0 - 1.0)
+                    elif self.v239:
                         for name, key in (("intrinsic_tone_preview.png", "intrinsic_tone_preview_rgb"), ("final_l_low.png", "final_l_low"), ("gamut_chroma_scale.png", "gamut_chroma_scale"), ("hair_alpha_final.png", "target_hair_alpha_final"), ("final_leakage_map.png", "non_hair_leakage_map")):
                             value = blending_aux[key]
                             if value.size(1) == 2:

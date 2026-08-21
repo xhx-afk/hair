@@ -17,11 +17,13 @@ def _dilate(mask: torch.Tensor, radius: int) -> torch.Tensor:
 
 
 class TargetHairMatteRefinerV838:
-    def __init__(self, *, ring_radius: int = 5, face_guard: float = 0.35) -> None:
+    def __init__(self, *, ring_radius: int = 5, face_guard: float = 0.35,
+                 use_appearance_confidence: bool = True) -> None:
         if ring_radius < 1 or not 0 <= face_guard <= 1:
             raise ValueError("V2.38 matte refiner parameters are invalid")
         self.ring_radius = int(ring_radius)
         self.face_guard = float(face_guard)
+        self.use_appearance_confidence = bool(use_appearance_confidence)
 
     def __call__(
         self, *, base_rgb: torch.Tensor, strong_anchor_rgb: torch.Tensor,
@@ -39,7 +41,10 @@ class TargetHairMatteRefinerV838:
         appearance_confidence = (appearance / (appearance.mean(dim=(-2, -1), keepdim=True) + 1e-4)).clamp(0, 2) / 2
         texture_confidence = (texture / (texture.mean(dim=(-2, -1), keepdim=True) + 1e-4)).clamp(0, 2) / 2
         geometry_confidence = F.avg_pool2d(allowed, 5, stride=1, padding=2)
-        boundary_alpha = (0.45 * geometry_confidence + 0.30 * appearance_confidence + 0.25 * texture_confidence).clamp(0, 1)
+        if self.use_appearance_confidence:
+            boundary_alpha = (0.45 * geometry_confidence + 0.30 * appearance_confidence + 0.25 * texture_confidence).clamp(0, 1)
+        else:
+            boundary_alpha = (0.60 * geometry_confidence + 0.25 * texture_confidence + 0.15 * geometry_confidence).clamp(0, 1)
         boundary_alpha = boundary_alpha * (1.0 - self.face_guard * face_contact_ring * face_intrusion_risk)
         alpha = (core + transition * boundary_alpha).clamp(0, 1) * support
         alpha = torch.where(core > 0.95, torch.ones_like(alpha), alpha)

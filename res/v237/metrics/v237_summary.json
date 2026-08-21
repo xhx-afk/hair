@@ -1,0 +1,21 @@
+{
+  "median_background_rgb_change_from_base": 0.0,
+  "median_base_leakage_fraction": 0.7047005891799927,
+  "median_boundary_error": 0.4937840700149536,
+  "median_chroma_strength_mean": 1.0,
+  "median_face_rgb_change_from_base": 0.0,
+  "median_face_rgb_change_from_base_max": 0.0,
+  "median_hair_chroma_ab_error": 13.071796417236328,
+  "median_hair_core_fraction": 0.30730438232421875,
+  "median_hair_core_full_transfer_fraction": 0.0274308193475008,
+  "median_hair_low_transfer_fraction": 0.8269753456115723,
+  "median_hair_reference_ab_distance_max_robust": 42.27089309692383,
+  "median_hair_reference_ab_distance_mean": 13.071796417236328,
+  "median_hair_reference_ab_distance_p90": 30.625420570373535,
+  "median_hair_reference_progress": 0.4779399186372757,
+  "median_hair_undertransfer_fraction": 0.0,
+  "median_non_hair_rgb_change_from_base": 0.0,
+  "median_palette_reliability": 0.9913160800933838,
+  "median_texture_preservation_error": 0.009885445702821016,
+  "count": 64
+}

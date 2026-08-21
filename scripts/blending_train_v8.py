@@ -176,7 +176,10 @@ from models.hair_only_chroma_disentanglement_v835 import HairOnlyChromaDisentang
 from models.v835_runtime_inputs import build_v835_runtime_inputs
 from models.hair_appearance_decomposition_v836 import HairAppearanceDecompositionTransferV836
 from models.v836_runtime_inputs import build_v836_runtime_inputs
+from models.hair_local_appearance_recomposition_v837 import HairLocalAppearanceRecompositionV837
+from models.v837_runtime_inputs import build_v837_runtime_inputs
 from utils.v235_metrics import v235_metric_tensors
+from utils.v237_metrics import v237_metric_tensors
 from utils.v231_metrics import (
     aggregate_v231,
     classify_matte_v231,
@@ -446,11 +449,19 @@ USER_V236_CHROMA_GAIN = float(os.environ.get("BLENDING_V236_CHROMA_GAIN", "1.0")
 USER_V236_ILLUMINATION_GAIN = float(os.environ.get("BLENDING_V236_ILLUMINATION_GAIN", "0.35"))
 USER_V236_MAX_ILLUMINATION_SHIFT = float(os.environ.get("BLENDING_V236_MAX_ILLUMINATION_SHIFT", "20.0"))
 USER_V236_VISUAL_COUNT = int(os.environ.get("BLENDING_V236_VISUAL_COUNT", "20"))
+USER_V237_DIAGNOSTIC_ONLY = os.environ.get("BLENDING_V237_DIAGNOSTIC_ONLY", "0") == "1"
+USER_V237_PALETTE_MAD_SCALE = float(os.environ.get("BLENDING_V237_PALETTE_MAD_SCALE", "3.5"))
+USER_V237_PALETTE_MIN_SUPPORT = int(os.environ.get("BLENDING_V237_PALETTE_MIN_SUPPORT", "16"))
+USER_V237_ILLUMINATION_RADIUS = int(os.environ.get("BLENDING_V237_ILLUMINATION_RADIUS", "11"))
+USER_V237_ANCHOR_HF_GAIN = float(os.environ.get("BLENDING_V237_ANCHOR_HF_GAIN", "0.9"))
+USER_V237_FACE_GUARD = float(os.environ.get("BLENDING_V237_FACE_GUARD", "1.0"))
+USER_V237_VISUAL_COUNT = int(os.environ.get("BLENDING_V237_VISUAL_COUNT", "20"))
 # Hair-only color latents are intentionally kept in separate namespaces. This
 # prevents a diagnostic run from silently reusing a pre-v2.35 full-image FS
 # embedding with the same source stem.
 V235_COLOR_CACHE_SUFFIX = "_v235_hair_only"
 V236_COLOR_CACHE_SUFFIX = "_v236_appearance"
+V237_COLOR_CACHE_SUFFIX = "_v237_palette"
 
 USER_USE_FID = False
 USER_FID_CACHE = "input/fid.pkl"
@@ -589,7 +600,9 @@ def role_key(role: str, stem: str) -> str:
 def fs_cache_name(role: str, stem: str) -> str:
     suffix = ""
     if role == "color":
-        if USER_V236_DIAGNOSTIC_ONLY:
+        if USER_V237_DIAGNOSTIC_ONLY:
+            suffix = V237_COLOR_CACHE_SUFFIX
+        elif USER_V236_DIAGNOSTIC_ONLY:
             suffix = V236_COLOR_CACHE_SUFFIX
         elif USER_V235_DIAGNOSTIC_ONLY:
             suffix = V235_COLOR_CACHE_SUFFIX
@@ -663,6 +676,7 @@ def build_cache_model() -> HairFast_v8:
     model_args.v233_enabled = False
     model_args.v234_enabled = False
     model_args.v236_enabled = bool(USER_V236_DIAGNOSTIC_ONLY)
+    model_args.v237_enabled = bool(USER_V237_DIAGNOSTIC_ONLY)
     # V2.35+ cache generation must use the same hair-only color preprocessing
     # as runtime inference. Other modes retain the legacy full-image encoder.
     model_args.v235_enabled = bool(USER_V235_DIAGNOSTIC_ONLY)
@@ -1173,6 +1187,13 @@ class BlendingTrainerV8:
             illumination_gain=USER_V236_ILLUMINATION_GAIN,
             max_illumination_shift=USER_V236_MAX_ILLUMINATION_SHIFT,
         ).to(self.device).eval()
+        self.v237_transfer = HairLocalAppearanceRecompositionV837(
+            palette_mad_scale=USER_V237_PALETTE_MAD_SCALE,
+            palette_min_support=USER_V237_PALETTE_MIN_SUPPORT,
+            illumination_radius=USER_V237_ILLUMINATION_RADIUS,
+            anchor_hf_gain=USER_V237_ANCHOR_HF_GAIN,
+            face_guard=USER_V237_FACE_GUARD,
+        )
         self.legacy_v223_projector = FullColorToneSelectiveProjectorV823(
             target_dir_min_ab=USER_V222_TARGET_DIR_MIN_AB,
             luma_low_radius=USER_V223_LUMA_LOW_RADIUS,
@@ -6873,6 +6894,131 @@ Human review remains required; record it in `visual_review/v228_visual_review.js
         return base, anchor, v226, pp_original, v230_final
 
     @torch.inference_mode()
+    def run_v237_diagnostic(self):
+        """Validate target-relative palette transfer and Base-owned recomposition."""
+        root = Path("res") / "v237"
+        active_root = ACTIVE_OUTPUT_DIR / "v237"
+        for path in (root, root / "debug", root / "comparisons" / "visual", root / "comparisons" / "appearance", root / "metrics"):
+            path.mkdir(parents=True, exist_ok=True)
+        records, visual_ids = [], []
+        visual_index = 0
+        post_process = PostProcessModel().to(self.device).eval()
+        pp_state = torch.load(USER_V227_PP_CHECKPOINT, map_location=self.device)
+        post_process.load_state_dict(pp_state["model_state_dict"])
+        for batch in tqdm(self.val_loader, desc="V2.37 hair-local appearance diagnostic", leave=False):
+            prepared = self.prepare_batch(batch)
+            if prepared is None:
+                continue
+            base, anchor, _, _, _ = self._render_v231_baselines(prepared, post_process)
+            ref_mask = prepared["reference_hair_mask"]
+            target_mask = prepared["v224_target_hair_mask"]
+            face_mask = prepared["v230_source_face_mask"]
+            runtime = build_v837_runtime_inputs(
+                base_rgb=base, strong_anchor_rgb=anchor,
+                color_reference_rgb=((prepared["color_i"] + 1.0) / 2.0).clamp(0, 1),
+                target_illumination_rgb=base,
+                target_hair_mask=target_mask, face_mask=face_mask,
+                reference_hair_mask=ref_mask, target_hair_alpha=target_mask,
+            )
+            final, aux = self.v237_transfer(return_aux=True, **runtime)
+            metrics = v237_metric_tensors(
+                base_rgb=base, final_rgb=final,
+                color_reference_rgb=runtime["color_reference_rgb"],
+                target_hair_mask=target_mask, face_mask=face_mask,
+                hair_alpha=aux["hair_alpha"],
+            )
+            target_ab_preview = torch.cat(
+                (aux["target_ab"], torch.zeros_like(aux["target_ab"][:, :1])), dim=1
+            ).clamp(-100, 100) / 50
+            palette_shadow_preview = aux["palette_shadow_rgb"].expand(-1, -1, base.shape[-2], base.shape[-1])
+            palette_mid_preview = aux["palette_mid_rgb"].expand(-1, -1, base.shape[-2], base.shape[-1])
+            palette_highlight_preview = aux["palette_highlight_rgb"].expand(-1, -1, base.shape[-2], base.shape[-1])
+            for index, sample_id in enumerate(prepared["sample_id"]):
+                row = {"sample_id": sample_id}
+                row.update({key: float(value[index].item()) for key, value in metrics.items()})
+                row.update({
+                    "palette_reliability": float(aux["palette_reliability"][index].mean().item()),
+                    "chroma_strength_mean": float(aux["chroma_strength"][index].mean().item()),
+                    "hair_core_fraction": float(aux["hair_core"][index].mean().item()),
+                    "hair_undertransfer_fraction": float(aux["hair_undertransfer_map"][index].mean().item()),
+                })
+                records.append(row)
+                if visual_index < USER_V237_VISUAL_COUNT:
+                    visual_ids.append(sample_id)
+                    save_preview(root / "comparisons" / "visual" / f"sample_{visual_index:03d}.png", [
+                        prepared["face_i"][index:index + 1], prepared["shape_i"][index:index + 1],
+                        prepared["color_i"][index:index + 1], base[index:index + 1] * 2 - 1,
+                        anchor[index:index + 1] * 2 - 1,
+                        palette_mid_preview[index:index + 1] * 2 - 1,
+                        aux["new_hair_rgb"][index:index + 1] * 2 - 1,
+                        mask_to_preview(aux["hair_alpha"][index:index + 1]),
+                        final[index:index + 1] * 2 - 1,
+                    ])
+                    save_preview(root / "comparisons" / "appearance" / f"sample_{visual_index:03d}.png", [
+                        palette_shadow_preview[index:index + 1] * 2 - 1,
+                        palette_mid_preview[index:index + 1] * 2 - 1,
+                        palette_highlight_preview[index:index + 1] * 2 - 1,
+                        mask_to_preview(aux["target_relative_l"][index:index + 1]),
+                        target_ab_preview[index:index + 1],
+                    ])
+                    debug = root / "debug" / f"sample_{visual_index:03d}"
+                    for filename, value in (
+                        ("base_rgb.png", base[index:index + 1] * 2 - 1),
+                        ("strong_anchor_rgb.png", anchor[index:index + 1] * 2 - 1),
+                        ("reference_hair_mask.png", mask_to_preview(aux["reference_hair_mask"][index:index + 1])),
+                        ("target_hair_mask.png", mask_to_preview(target_mask[index:index + 1])),
+                        ("hair_alpha.png", mask_to_preview(aux["hair_alpha"][index:index + 1])),
+                        ("hair_core.png", mask_to_preview(aux["hair_core"][index:index + 1])),
+                        ("hair_transition.png", mask_to_preview(aux["hair_transition"][index:index + 1])),
+                        ("palette_shadow.png", palette_shadow_preview[index:index + 1] * 2 - 1),
+                        ("palette_mid.png", palette_mid_preview[index:index + 1] * 2 - 1),
+                        ("palette_highlight.png", palette_highlight_preview[index:index + 1] * 2 - 1),
+                        ("target_relative_l.png", mask_to_preview(aux["target_relative_l"][index:index + 1])),
+                        ("target_chroma_field.png", target_ab_preview[index:index + 1]),
+                        ("new_hair_rgb.png", aux["new_hair_rgb"][index:index + 1] * 2 - 1),
+                        ("final_rgb.png", final[index:index + 1] * 2 - 1),
+                        ("final_minus_base.png", aux["final_minus_base"][index:index + 1].clamp(-1, 1)),
+                        ("non_hair_leakage_map.png", mask_to_preview(aux["non_hair_leakage_map"][index:index + 1].clamp(0, 1))),
+                        ("hair_undertransfer_map.png", mask_to_preview(aux["hair_undertransfer_map"][index:index + 1])),
+                    ):
+                        save_preview(debug / filename, value)
+                    visual_index += 1
+        if not records:
+            payload = {"version": "v2.37", "automatic_decision": "V237_NO_VALID_SAMPLES"}
+        else:
+            keys = sorted({key for row in records for key in row if key != "sample_id"})
+            summary = {f"median_{key}": float(np.median([row[key] for row in records])) for key in keys}
+            summary["count"] = len(records)
+            failed = []
+            if summary.get("median_face_rgb_change_from_base", 0) > 0.01:
+                failed.append("V237_FACE_BASE_PRESERVATION_FAIL")
+            if summary.get("median_background_rgb_change_from_base", 0) > 0.01:
+                failed.append("V237_BACKGROUND_BASE_PRESERVATION_FAIL")
+            if summary.get("median_hair_reference_progress", 0) < 0.65:
+                failed.append("V237_HAIR_COLOR_FIDELITY_FAIL")
+            if summary.get("median_base_leakage_fraction", 1) > 0.35:
+                failed.append("V237_BASE_LEAKAGE_FAIL")
+            if summary.get("median_hair_core_full_transfer_fraction", 0) < 0.80:
+                failed.append("V237_HAIR_COVERAGE_FAIL")
+            payload = {
+                "version": "v2.37", "training": False,
+                "mode": "HAIR_LOCAL_APPEARANCE_RECOMPOSITION",
+                "non_hair_owner": "BASE_SOURCE_PRESERVED",
+                "hair_structure_owner": "STRONG_ANCHOR_HAIR_ONLY",
+                "chroma_owner": "REFERENCE_HAIR_ROBUST_PALETTE",
+                "illumination_owner": "TARGET_SATD_LOW_FREQUENCY_L",
+                "summary": summary, "failed_gates": failed,
+                "automatic_decision": failed[0] if failed else "V237_READY_FOR_VISUAL_REVIEW",
+            }
+            (root / "per_sample.jsonl").write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in records) + "\n", encoding="utf-8")
+            (root / "metrics" / "v237_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        (root / "v237_acceptance.json").write_text(json.dumps({**payload, "visual_sample_ids": visual_ids}, indent=2, ensure_ascii=False), encoding="utf-8")
+        shutil.copytree(root, active_root, dirs_exist_ok=True)
+        print(f"[V2.37] failed_gates={payload.get('failed_gates', [])}")
+        print(f"[V2.37] Decision={payload['automatic_decision']}")
+        return payload
+
+    @torch.inference_mode()
     def run_v236_diagnostic(self):
         """Run hair-only AB plus Target/SATD low-frequency L transfer."""
         root = Path("res") / "v236"
@@ -8079,7 +8225,10 @@ Human review remains required; record it in `visual_review/v228_visual_review.js
             raise RuntimeError(
                 "V2.31 diagnostic-only mode does not accept a resume checkpoint"
             )
-        if USER_V236_DIAGNOSTIC_ONLY:
+        if USER_V237_DIAGNOSTIC_ONLY:
+            summary = self.run_v237_diagnostic()
+            history = [{"phase": "v237_hair_local_appearance_recomposition_diagnostic_only", **summary}]
+        elif USER_V236_DIAGNOSTIC_ONLY:
             summary = self.run_v236_diagnostic()
             history = [{"phase": "v236_hair_appearance_decomposition_diagnostic_only", **summary}]
         elif USER_V235_DIAGNOSTIC_ONLY:
@@ -8104,7 +8253,7 @@ Human review remains required; record it in `visual_review/v228_visual_review.js
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, "w", encoding="utf-8") as handle:
                 json.dump(history, handle, ensure_ascii=False, indent=2, allow_nan=False)
-        diagnostic_name = "v236" if USER_V236_DIAGNOSTIC_ONLY else "v235" if USER_V235_DIAGNOSTIC_ONLY else "v234" if USER_V234_DIAGNOSTIC_ONLY else "v233_diagnostic" if USER_V233_DIAGNOSTIC_ONLY else "v232_diagnostic" if USER_V232_DIAGNOSTIC_ONLY else "v231_diagnostic"
+        diagnostic_name = "v237" if USER_V237_DIAGNOSTIC_ONLY else "v236" if USER_V236_DIAGNOSTIC_ONLY else "v235" if USER_V235_DIAGNOSTIC_ONLY else "v234" if USER_V234_DIAGNOSTIC_ONLY else "v233_diagnostic" if USER_V233_DIAGNOSTIC_ONLY else "v232_diagnostic" if USER_V232_DIAGNOSTIC_ONLY else "v231_diagnostic"
         source_comparisons = ACTIVE_OUTPUT_DIR / diagnostic_name / "comparisons"
         comparisons_root = ACTIVE_OUTPUT_DIR / "comparisons"
         if source_comparisons.exists():
@@ -8132,7 +8281,7 @@ def main():
     ensure_dataset_cache_v8(triplets)
     teacher_cache_path = ACTIVE_DATASET_DIR / USER_TEACHER_CACHE_NAME
     teacher_records = None
-    active_version = "V2.36" if USER_V236_DIAGNOSTIC_ONLY else "V2.35" if USER_V235_DIAGNOSTIC_ONLY else "V2.34" if USER_V234_DIAGNOSTIC_ONLY else "V2.33" if USER_V233_DIAGNOSTIC_ONLY else "V2.32" if USER_V232_DIAGNOSTIC_ONLY else "V2.31"
+    active_version = "V2.37" if USER_V237_DIAGNOSTIC_ONLY else "V2.36" if USER_V236_DIAGNOSTIC_ONLY else "V2.35" if USER_V235_DIAGNOSTIC_ONLY else "V2.34" if USER_V234_DIAGNOSTIC_ONLY else "V2.33" if USER_V233_DIAGNOSTIC_ONLY else "V2.32" if USER_V232_DIAGNOSTIC_ONLY else "V2.31"
     print(f"[{active_version}] deterministic validation only; no training")
     print(f"[{active_version}] teacher alpha/controller disabled")
     train_exps, val_exps = train_test_split(triplets, test_size=ACTIVE_VAL_SIZE, random_state=USER_RANDOM_SEED)
@@ -8174,7 +8323,17 @@ def main():
         USER_V227_BASE_CHECKPOINT, device
     )
     trainer = BlendingTrainerV8(model, None, train_loader, val_loader, helper)
-    if USER_V236_DIAGNOSTIC_ONLY:
+    if USER_V237_DIAGNOSTIC_ONLY:
+        print(
+            "[V2.37] training=False\n"
+            "[V2.37] non_hair_owner=BASE_SOURCE_PRESERVED\n"
+            "[V2.37] chroma_owner=REFERENCE_HAIR_ROBUST_PALETTE\n"
+            "[V2.37] spatial_mapping=TARGET_RELATIVE_LUMINANCE\n"
+            "[V2.37] illumination_owner=TARGET_SATD_LOW_FREQUENCY_L\n"
+            f"[V2.37] anchor_hf_gain={USER_V237_ANCHOR_HF_GAIN}",
+            file=sys.stderr,
+        )
+    elif USER_V236_DIAGNOSTIC_ONLY:
         print(
             "[V2.36] training=False\n"
             "[V2.36] color_owner=COLOR_REFERENCE_HAIR_LAB_AB\n"
@@ -8218,8 +8377,16 @@ def main():
             "[V2.33] white_net_metric=True",
             file=sys.stderr,
         )
-    mode_header = "[V2.36] mode=HAIR_APPEARANCE_DECOMPOSITION_TRANSFER\n" if USER_V236_DIAGNOSTIC_ONLY else "[V2.35] mode=HAIR_ONLY_CHROMA_DISENTANGLEMENT\n" if USER_V235_DIAGNOSTIC_ONLY else "[V2.34] mode=HAIR_CARRIER_CHROMA_FIELD_INJECTION\n" if USER_V234_DIAGNOSTIC_ONLY else "[V2.33] mode=CONFIDENCE_LIMITED_FOREGROUND_ALPHA_CONSISTENT\n" if USER_V233_DIAGNOSTIC_ONLY else "[V2.32] mode=FOREGROUND_RECOLOR_MATTING_RECOMPOSE\n" if USER_V232_DIAGNOSTIC_ONLY else "[V2.31] mode=HIRES_VITMATTE_PP_UNIFIED_RECOLOR\n"
+    mode_header = "[V2.37] mode=HAIR_LOCAL_APPEARANCE_RECOMPOSITION\n" if USER_V237_DIAGNOSTIC_ONLY else "[V2.36] mode=HAIR_APPEARANCE_DECOMPOSITION_TRANSFER\n" if USER_V236_DIAGNOSTIC_ONLY else "[V2.35] mode=HAIR_ONLY_CHROMA_DISENTANGLEMENT\n" if USER_V235_DIAGNOSTIC_ONLY else "[V2.34] mode=HAIR_CARRIER_CHROMA_FIELD_INJECTION\n" if USER_V234_DIAGNOSTIC_ONLY else "[V2.33] mode=CONFIDENCE_LIMITED_FOREGROUND_ALPHA_CONSISTENT\n" if USER_V233_DIAGNOSTIC_ONLY else "[V2.32] mode=FOREGROUND_RECOLOR_MATTING_RECOMPOSE\n" if USER_V232_DIAGNOSTIC_ONLY else "[V2.31] mode=HIRES_VITMATTE_PP_UNIFIED_RECOLOR\n"
     mode_details = (
+        "[V2.37] training=False\n"
+        "[V2.37] non_hair_owner=BASE_SOURCE_PRESERVED\n"
+        "[V2.37] chroma_owner=REFERENCE_HAIR_ROBUST_PALETTE\n"
+        "[V2.37] spatial_mapping=TARGET_RELATIVE_LUMINANCE\n"
+        "[V2.37] illumination_owner=TARGET_SATD_LOW_FREQUENCY_L\n"
+        f"[V2.37] anchor_hf_gain={USER_V237_ANCHOR_HF_GAIN}\n"
+        f"[V2.37] base_checkpoint={USER_V227_BASE_CHECKPOINT}"
+        if USER_V237_DIAGNOSTIC_ONLY else
         "[V2.36] training=False\n"
         "[V2.36] reference_input=HAIR_ONLY_RGB_CROP\n"
         "[V2.36] chroma_channels=LAB_AB_ONLY\n"
@@ -8290,7 +8457,7 @@ def main():
         f"correction_budget_ratios=({USER_CORRECTION_CHROMA_BUDGET_RATIO},"
         f"{USER_CORRECTION_LUMA_BUDGET_RATIO}) "
         f"correction_orth_scale={USER_CORRECTION_ORTH_SCALE} "
-        f"training_mode={'V236_HAIR_APPEARANCE_DECOMPOSITION_DIAGNOSTIC_ONLY' if USER_V236_DIAGNOSTIC_ONLY else 'V235_HAIR_ONLY_CHROMA_DISENTANGLEMENT_DIAGNOSTIC_ONLY' if USER_V235_DIAGNOSTIC_ONLY else 'V234_HAIR_CARRIER_CHROMA_FIELD_INJECTION_DIAGNOSTIC_ONLY' if USER_V234_DIAGNOSTIC_ONLY else 'V233_CONFIDENCE_LIMITED_FG_ALPHA_CONSISTENT_DIAGNOSTIC_ONLY' if USER_V233_DIAGNOSTIC_ONLY else 'V232_FOREGROUND_RECOLOR_MATTING_RECOMPOSE_DIAGNOSTIC_ONLY' if USER_V232_DIAGNOSTIC_ONLY else 'V231_HIRES_VITMATTE_PP_UNIFIED_RECOLOR_DIAGNOSTIC_ONLY'} "
+        f"training_mode={'V237_HAIR_LOCAL_APPEARANCE_RECOMPOSITION_DIAGNOSTIC_ONLY' if USER_V237_DIAGNOSTIC_ONLY else 'V236_HAIR_APPEARANCE_DECOMPOSITION_DIAGNOSTIC_ONLY' if USER_V236_DIAGNOSTIC_ONLY else 'V235_HAIR_ONLY_CHROMA_DISENTANGLEMENT_DIAGNOSTIC_ONLY' if USER_V235_DIAGNOSTIC_ONLY else 'V234_HAIR_CARRIER_CHROMA_FIELD_INJECTION_DIAGNOSTIC_ONLY' if USER_V234_DIAGNOSTIC_ONLY else 'V233_CONFIDENCE_LIMITED_FG_ALPHA_CONSISTENT_DIAGNOSTIC_ONLY' if USER_V233_DIAGNOSTIC_ONLY else 'V232_FOREGROUND_RECOLOR_MATTING_RECOMPOSE_DIAGNOSTIC_ONLY' if USER_V232_DIAGNOSTIC_ONLY else 'V231_HIRES_VITMATTE_PP_UNIFIED_RECOLOR_DIAGNOSTIC_ONLY'} "
         f"foreground_roi_padding={USER_V232_FOREGROUND_ROI_PADDING} "
         f"foreground_cache={USER_V232_FOREGROUND_CACHE or '<none>'} "
         f"foreground_backend={'PYMATTING_MULTILEVEL' if USER_V232_DIAGNOSTIC_ONLY else 'disabled'} "

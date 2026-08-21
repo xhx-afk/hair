@@ -178,8 +178,11 @@ from models.hair_appearance_decomposition_v836 import HairAppearanceDecompositio
 from models.v836_runtime_inputs import build_v836_runtime_inputs
 from models.hair_local_appearance_recomposition_v837 import HairLocalAppearanceRecompositionV837
 from models.v837_runtime_inputs import build_v837_runtime_inputs
+from models.hair_local_recomposition_v838 import HairLocalRecompositionV838
+from models.v838_runtime_inputs import build_v838_runtime_inputs
 from utils.v235_metrics import v235_metric_tensors
 from utils.v237_metrics import v237_metric_tensors
+from utils.v238_metrics import v238_metric_tensors
 from utils.v231_metrics import (
     aggregate_v231,
     classify_matte_v231,
@@ -456,12 +459,23 @@ USER_V237_ILLUMINATION_RADIUS = int(os.environ.get("BLENDING_V237_ILLUMINATION_R
 USER_V237_ANCHOR_HF_GAIN = float(os.environ.get("BLENDING_V237_ANCHOR_HF_GAIN", "0.9"))
 USER_V237_FACE_GUARD = float(os.environ.get("BLENDING_V237_FACE_GUARD", "1.0"))
 USER_V237_VISUAL_COUNT = int(os.environ.get("BLENDING_V237_VISUAL_COUNT", "20"))
+USER_V238_DIAGNOSTIC_ONLY = os.environ.get("BLENDING_V238_DIAGNOSTIC_ONLY", "0") == "1"
+USER_V238_PALETTE_MAD_SCALE = float(os.environ.get("BLENDING_V238_PALETTE_MAD_SCALE", "3.5"))
+USER_V238_PALETTE_MIN_SUPPORT = int(os.environ.get("BLENDING_V238_PALETTE_MIN_SUPPORT", "16"))
+USER_V238_ILLUMINATION_RADIUS = int(os.environ.get("BLENDING_V238_ILLUMINATION_RADIUS", "11"))
+USER_V238_ANCHOR_HF_GAIN = float(os.environ.get("BLENDING_V238_ANCHOR_HF_GAIN", "0.9"))
+USER_V238_CONTACT_RADIUS = int(os.environ.get("BLENDING_V238_CONTACT_RADIUS", "5"))
+USER_V238_RISK_STRENGTH = float(os.environ.get("BLENDING_V238_RISK_STRENGTH", "0.65"))
+USER_V238_MATTE_RING_RADIUS = int(os.environ.get("BLENDING_V238_MATTE_RING_RADIUS", "5"))
+USER_V238_FACE_GUARD = float(os.environ.get("BLENDING_V238_FACE_GUARD", "0.35"))
+USER_V238_VISUAL_COUNT = int(os.environ.get("BLENDING_V238_VISUAL_COUNT", "20"))
 # Hair-only color latents are intentionally kept in separate namespaces. This
 # prevents a diagnostic run from silently reusing a pre-v2.35 full-image FS
 # embedding with the same source stem.
 V235_COLOR_CACHE_SUFFIX = "_v235_hair_only"
 V236_COLOR_CACHE_SUFFIX = "_v236_appearance"
 V237_COLOR_CACHE_SUFFIX = "_v237_palette"
+V238_COLOR_CACHE_SUFFIX = "_v238_occlusion_matte"
 
 USER_USE_FID = False
 USER_FID_CACHE = "input/fid.pkl"
@@ -600,7 +614,9 @@ def role_key(role: str, stem: str) -> str:
 def fs_cache_name(role: str, stem: str) -> str:
     suffix = ""
     if role == "color":
-        if USER_V237_DIAGNOSTIC_ONLY:
+        if USER_V238_DIAGNOSTIC_ONLY:
+            suffix = V238_COLOR_CACHE_SUFFIX
+        elif USER_V237_DIAGNOSTIC_ONLY:
             suffix = V237_COLOR_CACHE_SUFFIX
         elif USER_V236_DIAGNOSTIC_ONLY:
             suffix = V236_COLOR_CACHE_SUFFIX
@@ -677,6 +693,7 @@ def build_cache_model() -> HairFast_v8:
     model_args.v234_enabled = False
     model_args.v236_enabled = bool(USER_V236_DIAGNOSTIC_ONLY)
     model_args.v237_enabled = bool(USER_V237_DIAGNOSTIC_ONLY)
+    model_args.v238_enabled = bool(USER_V238_DIAGNOSTIC_ONLY)
     # V2.35+ cache generation must use the same hair-only color preprocessing
     # as runtime inference. Other modes retain the legacy full-image encoder.
     model_args.v235_enabled = bool(USER_V235_DIAGNOSTIC_ONLY)
@@ -1193,6 +1210,16 @@ class BlendingTrainerV8:
             illumination_radius=USER_V237_ILLUMINATION_RADIUS,
             anchor_hf_gain=USER_V237_ANCHOR_HF_GAIN,
             face_guard=USER_V237_FACE_GUARD,
+        )
+        self.v238_transfer = HairLocalRecompositionV838(
+            palette_mad_scale=USER_V238_PALETTE_MAD_SCALE,
+            palette_min_support=USER_V238_PALETTE_MIN_SUPPORT,
+            illumination_radius=USER_V238_ILLUMINATION_RADIUS,
+            anchor_hf_gain=USER_V238_ANCHOR_HF_GAIN,
+            contact_radius=USER_V238_CONTACT_RADIUS,
+            risk_strength=USER_V238_RISK_STRENGTH,
+            matte_ring_radius=USER_V238_MATTE_RING_RADIUS,
+            face_guard=USER_V238_FACE_GUARD,
         )
         self.legacy_v223_projector = FullColorToneSelectiveProjectorV823(
             target_dir_min_ab=USER_V222_TARGET_DIR_MIN_AB,
@@ -6894,6 +6921,125 @@ Human review remains required; record it in `visual_review/v228_visual_review.js
         return base, anchor, v226, pp_original, v230_final
 
     @torch.inference_mode()
+    def run_v238_diagnostic(self):
+        """Validate target-hair occlusion ownership and continuous final matte."""
+        root = Path("res") / "v238"
+        active_root = ACTIVE_OUTPUT_DIR / "v238"
+        for path in (root, root / "debug", root / "comparisons" / "visual", root / "metrics"):
+            path.mkdir(parents=True, exist_ok=True)
+        records, visual_ids = [], []
+        visual_index = 0
+        post_process = PostProcessModel().to(self.device).eval()
+        pp_state = torch.load(USER_V227_PP_CHECKPOINT, map_location=self.device)
+        post_process.load_state_dict(pp_state["model_state_dict"])
+        for batch in tqdm(self.val_loader, desc="V2.38 occlusion-aware matte diagnostic", leave=False):
+            prepared = self.prepare_batch(batch)
+            if prepared is None:
+                continue
+            base, anchor, _, _, _ = self._render_v231_baselines(prepared, post_process)
+            target_mask = prepared["v224_target_hair_mask"]
+            face_mask = prepared["v230_source_face_mask"]
+            skin_mask = prepared["v230_source_skin_mask"]
+            runtime = build_v838_runtime_inputs(
+                base_rgb=base, strong_anchor_rgb=anchor,
+                color_reference_rgb=((prepared["color_i"] + 1.0) / 2.0).clamp(0, 1),
+                target_illumination_rgb=base,
+                coarse_target_hair_mask=target_mask,
+                source_face_mask=face_mask, source_skin_mask=skin_mask,
+                reference_hair_mask=prepared["reference_hair_mask"],
+            )
+            final, aux = self.v238_transfer(return_aux=True, **runtime)
+            metrics = v238_metric_tensors(
+                base_rgb=base, final_rgb=final,
+                color_reference_rgb=runtime["color_reference_rgb"],
+                coarse_target_hair_mask=runtime["coarse_target_hair_mask"],
+                source_face_mask=runtime["source_face_mask"],
+                hair_alpha_final=aux["target_hair_alpha_final"],
+                allowed_hair_mask=aux["occlusion_allowed_hair"],
+            )
+            target_ab_preview = torch.cat(
+                (aux["target_ab"], torch.zeros_like(aux["target_ab"][:, :1])), dim=1
+            ).clamp(-100, 100) / 50
+            for index, sample_id in enumerate(prepared["sample_id"]):
+                row = {"sample_id": sample_id}
+                row.update({key: float(value[index].item()) for key, value in metrics.items()})
+                row.update({
+                    "chroma_strength_mean": float(aux["chroma_strength"][index].mean().item()),
+                    "hair_core_fraction": float(aux["target_hair_core"][index].mean().item()),
+                    "blocked_target_hair_fraction": float(aux["face_intrusion_risk"][index].mean().item()),
+                })
+                records.append(row)
+                if visual_index < USER_V238_VISUAL_COUNT:
+                    visual_ids.append(sample_id)
+                    save_preview(root / "comparisons" / "visual" / f"sample_{visual_index:03d}.png", [
+                        prepared["face_i"][index:index + 1], prepared["shape_i"][index:index + 1],
+                        prepared["color_i"][index:index + 1], base[index:index + 1] * 2 - 1,
+                        anchor[index:index + 1] * 2 - 1, aux["new_hair_rgb"][index:index + 1] * 2 - 1,
+                        mask_to_preview(aux["target_hair_alpha_final"][index:index + 1]),
+                        final[index:index + 1] * 2 - 1,
+                    ])
+                    debug = root / "debug" / f"sample_{visual_index:03d}"
+                    debug_values = (
+                        ("base_rgb.png", base[index:index + 1] * 2 - 1),
+                        ("strong_anchor_rgb.png", anchor[index:index + 1] * 2 - 1),
+                        ("new_hair_rgb.png", aux["new_hair_rgb"][index:index + 1] * 2 - 1),
+                        ("coarse_target_hair_mask.png", mask_to_preview(runtime["coarse_target_hair_mask"][index:index + 1])),
+                        ("source_face_mask.png", mask_to_preview(runtime["source_face_mask"][index:index + 1])),
+                        ("source_skin_mask.png", mask_to_preview(runtime["source_skin_mask"][index:index + 1])),
+                        ("overlap_face_hair.png", mask_to_preview(aux["overlap_face_hair"][index:index + 1])),
+                        ("allowed_hair_mask.png", mask_to_preview(aux["occlusion_allowed_hair"][index:index + 1])),
+                        ("face_contact_ring.png", mask_to_preview(aux["face_contact_ring"][index:index + 1])),
+                        ("face_intrusion_risk.png", mask_to_preview(aux["face_intrusion_risk"][index:index + 1])),
+                        ("hair_alpha_final.png", mask_to_preview(aux["target_hair_alpha_final"][index:index + 1])),
+                        ("hair_core.png", mask_to_preview(aux["target_hair_core"][index:index + 1])),
+                        ("hair_transition.png", mask_to_preview(aux["target_hair_transition"][index:index + 1])),
+                        ("hair_background.png", mask_to_preview(aux["target_hair_background"][index:index + 1])),
+                        ("target_chroma_field.png", target_ab_preview[index:index + 1]),
+                        ("final_rgb.png", final[index:index + 1] * 2 - 1),
+                        ("final_minus_base.png", aux["final_minus_base"][index:index + 1].clamp(-1, 1)),
+                        ("hair_undertransfer_map.png", mask_to_preview(aux["hair_undertransfer_map"][index:index + 1])),
+                        ("boundary_artifact_map.png", mask_to_preview(aux["boundary_artifact_map"][index:index + 1].clamp(0, 1))),
+                    )
+                    for filename, value in debug_values:
+                        save_preview(debug / filename, value)
+                    visual_index += 1
+        if not records:
+            payload = {"version": "v2.38", "automatic_decision": "V238_NO_VALID_SAMPLES"}
+        else:
+            keys = sorted({key for row in records for key in row if key != "sample_id"})
+            summary = {f"median_{key}": float(np.median([row[key] for row in records])) for key in keys}
+            summary["count"] = len(records)
+            failed = []
+            gates = (
+                ("median_face_rgb_change_from_base", 0.01, "V238_FACE_BASE_PRESERVATION_FAIL", lambda x, t: x > t),
+                ("median_background_rgb_change_from_base", 0.01, "V238_BACKGROUND_BASE_PRESERVATION_FAIL", lambda x, t: x > t),
+                ("median_hair_reference_progress", 0.60, "V238_HAIR_COLOR_FIDELITY_FAIL", lambda x, t: x < t),
+                ("median_base_leakage_fraction", 0.45, "V238_BASE_LEAKAGE_FAIL", lambda x, t: x > t),
+                ("median_hair_low_transfer_fraction", 0.50, "V238_LOW_TRANSFER_FAIL", lambda x, t: x > t),
+                ("median_hair_core_full_transfer_fraction", 0.20, "V238_CORE_TRANSFER_FAIL", lambda x, t: x < t),
+            )
+            for key, threshold, name, bad in gates:
+                if bad(summary.get(key, 0.0), threshold):
+                    failed.append(name)
+            payload = {
+                "version": "v2.38", "training": False,
+                "mode": "TARGET_HAIR_OCCLUSION_AWARE_MATTE",
+                "non_hair_owner": "BASE_SOURCE_PRESERVED",
+                "topology_owner": "TARGET_HAIR_COARSE_PRIOR",
+                "occlusion_owner": "TARGET_HAIR_OCCLUSION_RESOLVER",
+                "matte_owner": "HIGH_RES_RULE_BASED_REFINER",
+                "summary": summary, "failed_gates": failed,
+                "automatic_decision": failed[0] if failed else "V238_READY_FOR_VISUAL_REVIEW",
+            }
+            (root / "per_sample.jsonl").write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in records) + "\n", encoding="utf-8")
+            (root / "metrics" / "v238_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        (root / "v238_acceptance.json").write_text(json.dumps({**payload, "visual_sample_ids": visual_ids}, indent=2, ensure_ascii=False), encoding="utf-8")
+        shutil.copytree(root, active_root, dirs_exist_ok=True)
+        print(f"[V2.38] failed_gates={payload.get('failed_gates', [])}")
+        print(f"[V2.38] Decision={payload['automatic_decision']}")
+        return payload
+
+    @torch.inference_mode()
     def run_v237_diagnostic(self):
         """Validate target-relative palette transfer and Base-owned recomposition."""
         root = Path("res") / "v237"
@@ -8225,7 +8371,10 @@ Human review remains required; record it in `visual_review/v228_visual_review.js
             raise RuntimeError(
                 "V2.31 diagnostic-only mode does not accept a resume checkpoint"
             )
-        if USER_V237_DIAGNOSTIC_ONLY:
+        if USER_V238_DIAGNOSTIC_ONLY:
+            summary = self.run_v238_diagnostic()
+            history = [{"phase": "v238_target_hair_occlusion_aware_matte_diagnostic_only", **summary}]
+        elif USER_V237_DIAGNOSTIC_ONLY:
             summary = self.run_v237_diagnostic()
             history = [{"phase": "v237_hair_local_appearance_recomposition_diagnostic_only", **summary}]
         elif USER_V236_DIAGNOSTIC_ONLY:
@@ -8253,7 +8402,7 @@ Human review remains required; record it in `visual_review/v228_visual_review.js
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, "w", encoding="utf-8") as handle:
                 json.dump(history, handle, ensure_ascii=False, indent=2, allow_nan=False)
-        diagnostic_name = "v237" if USER_V237_DIAGNOSTIC_ONLY else "v236" if USER_V236_DIAGNOSTIC_ONLY else "v235" if USER_V235_DIAGNOSTIC_ONLY else "v234" if USER_V234_DIAGNOSTIC_ONLY else "v233_diagnostic" if USER_V233_DIAGNOSTIC_ONLY else "v232_diagnostic" if USER_V232_DIAGNOSTIC_ONLY else "v231_diagnostic"
+        diagnostic_name = "v238" if USER_V238_DIAGNOSTIC_ONLY else "v237" if USER_V237_DIAGNOSTIC_ONLY else "v236" if USER_V236_DIAGNOSTIC_ONLY else "v235" if USER_V235_DIAGNOSTIC_ONLY else "v234" if USER_V234_DIAGNOSTIC_ONLY else "v233_diagnostic" if USER_V233_DIAGNOSTIC_ONLY else "v232_diagnostic" if USER_V232_DIAGNOSTIC_ONLY else "v231_diagnostic"
         source_comparisons = ACTIVE_OUTPUT_DIR / diagnostic_name / "comparisons"
         comparisons_root = ACTIVE_OUTPUT_DIR / "comparisons"
         if source_comparisons.exists():
@@ -8281,7 +8430,7 @@ def main():
     ensure_dataset_cache_v8(triplets)
     teacher_cache_path = ACTIVE_DATASET_DIR / USER_TEACHER_CACHE_NAME
     teacher_records = None
-    active_version = "V2.37" if USER_V237_DIAGNOSTIC_ONLY else "V2.36" if USER_V236_DIAGNOSTIC_ONLY else "V2.35" if USER_V235_DIAGNOSTIC_ONLY else "V2.34" if USER_V234_DIAGNOSTIC_ONLY else "V2.33" if USER_V233_DIAGNOSTIC_ONLY else "V2.32" if USER_V232_DIAGNOSTIC_ONLY else "V2.31"
+    active_version = "V2.38" if USER_V238_DIAGNOSTIC_ONLY else "V2.37" if USER_V237_DIAGNOSTIC_ONLY else "V2.36" if USER_V236_DIAGNOSTIC_ONLY else "V2.35" if USER_V235_DIAGNOSTIC_ONLY else "V2.34" if USER_V234_DIAGNOSTIC_ONLY else "V2.33" if USER_V233_DIAGNOSTIC_ONLY else "V2.32" if USER_V232_DIAGNOSTIC_ONLY else "V2.31"
     print(f"[{active_version}] deterministic validation only; no training")
     print(f"[{active_version}] teacher alpha/controller disabled")
     train_exps, val_exps = train_test_split(triplets, test_size=ACTIVE_VAL_SIZE, random_state=USER_RANDOM_SEED)
@@ -8323,7 +8472,17 @@ def main():
         USER_V227_BASE_CHECKPOINT, device
     )
     trainer = BlendingTrainerV8(model, None, train_loader, val_loader, helper)
-    if USER_V237_DIAGNOSTIC_ONLY:
+    if USER_V238_DIAGNOSTIC_ONLY:
+        print(
+            "[V2.38] training=False\n"
+            "[V2.38] non_hair_owner=BASE_SOURCE_PRESERVED\n"
+            "[V2.38] topology_owner=TARGET_HAIR_COARSE_PRIOR\n"
+            "[V2.38] occlusion_owner=TARGET_HAIR_OCCLUSION_RESOLVER\n"
+            "[V2.38] matte_owner=HIGH_RES_RULE_BASED_REFINER\n"
+            f"[V2.38] face_guard={USER_V238_FACE_GUARD}",
+            file=sys.stderr,
+        )
+    elif USER_V237_DIAGNOSTIC_ONLY:
         print(
             "[V2.37] training=False\n"
             "[V2.37] non_hair_owner=BASE_SOURCE_PRESERVED\n"
@@ -8427,6 +8586,17 @@ def main():
         f"[V2.31] vitmatte_path={USER_V231_VITMATTE_PATH}\n"
         f"[V2.31] base_checkpoint={USER_V227_BASE_CHECKPOINT}"
     )
+    if USER_V238_DIAGNOSTIC_ONLY:
+        mode_header = "[V2.38] mode=TARGET_HAIR_OCCLUSION_AWARE_MATTE\n"
+        mode_details = (
+            "[V2.38] training=False\n"
+            "[V2.38] non_hair_owner=BASE_SOURCE_PRESERVED\n"
+            "[V2.38] topology_owner=TARGET_HAIR_COARSE_PRIOR\n"
+            "[V2.38] occlusion_owner=TARGET_HAIR_OCCLUSION_RESOLVER\n"
+            "[V2.38] matte_owner=HIGH_RES_RULE_BASED_REFINER\n"
+            f"[V2.38] contact_radius={USER_V238_CONTACT_RADIUS} matte_ring_radius={USER_V238_MATTE_RING_RADIUS}\n"
+            f"[V2.38] base_checkpoint={USER_V227_BASE_CHECKPOINT}"
+        )
     print(
         mode_header + mode_details,
         file=sys.stderr,

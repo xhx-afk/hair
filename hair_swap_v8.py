@@ -83,6 +83,8 @@ class HairFast_v8:
         if align:
             images = align_face(images)
         if (
+            getattr(self.args, "v238_enabled", False)
+            or
             getattr(self.args, "v237_enabled", False)
             or getattr(self.args, "v236_enabled", False)
             or getattr(self.args, "v235_enabled", False)
@@ -220,6 +222,16 @@ def get_parser_v8():
     parser.add_argument("--v237-illumination-radius", type=int, default=11)
     parser.add_argument("--v237-anchor-hf-gain", type=float, default=0.9)
     parser.add_argument("--v237-face-guard", type=float, default=1.0)
+    parser.add_argument("--disable-v238", dest="v238_enabled", action="store_false")
+    parser.set_defaults(v238_enabled=True)
+    parser.add_argument("--v238-palette-mad-scale", type=float, default=3.5)
+    parser.add_argument("--v238-palette-min-support", type=int, default=16)
+    parser.add_argument("--v238-illumination-radius", type=int, default=11)
+    parser.add_argument("--v238-anchor-hf-gain", type=float, default=0.9)
+    parser.add_argument("--v238-contact-radius", type=int, default=5)
+    parser.add_argument("--v238-risk-strength", type=float, default=0.65)
+    parser.add_argument("--v238-matte-ring-radius", type=int, default=5)
+    parser.add_argument("--v238-face-guard", type=float, default=0.35)
     parser.add_argument("--use_satd_v8", action="store_true")
     parser.add_argument("--satd_checkpoint_v8", type=str, default="")
     parser.add_argument("--satd_blend_v8", type=float, default=0.28)

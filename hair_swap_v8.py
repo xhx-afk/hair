@@ -83,6 +83,8 @@ class HairFast_v8:
         if align:
             images = align_face(images)
         if (
+            getattr(self.args, "v243_enabled", False)
+            or
             getattr(self.args, "v241_enabled", False)
             or
             getattr(self.args, "v238_enabled", False)
@@ -265,6 +267,8 @@ def get_parser_v8():
     parser.add_argument("--v240-face-guard", type=float, default=0.35)
     parser.add_argument("--disable-v241", dest="v241_enabled", action="store_false")
     parser.set_defaults(v241_enabled=True)
+    parser.add_argument("--v243-enabled", dest="v243_enabled", action="store_true")
+    parser.set_defaults(v243_enabled=False)
     parser.add_argument("--v241-palette-mad-scale", type=float, default=3.5)
     parser.add_argument("--v241-palette-min-support", type=int, default=16)
     parser.add_argument("--v241-illumination-radius", type=int, default=11)

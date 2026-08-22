@@ -186,6 +186,7 @@ from models.hair_local_recomposition_v840 import HairLocalRecompositionV840
 from models.v840_runtime_inputs import build_v840_runtime_inputs
 from models.hair_local_recomposition_v841 import HairLocalRecompositionV841
 from models.hair_local_recomposition_v842 import HairLocalRecompositionV842
+from models.hair_local_recomposition_v843 import HairLocalRecompositionV843
 from models.v841_runtime_inputs import build_v841_runtime_inputs
 from utils.v235_metrics import v235_metric_tensors
 from utils.v237_metrics import v237_metric_tensors
@@ -194,6 +195,7 @@ from utils.v239_metrics import v239_metric_tensors
 from utils.v240_metrics import v240_metric_tensors
 from utils.v241_metrics import aggregate_v2412_records, v241_metric_tensors
 from utils.v242_metrics import v242_metric_tensors
+from utils.v243_metrics import v243_metric_tensors
 from utils.v231_metrics import (
     aggregate_v231,
     classify_matte_v231,
@@ -507,8 +509,9 @@ USER_V240_FACE_GUARD = float(os.environ.get("BLENDING_V240_FACE_GUARD", "0.35"))
 USER_V240_VISUAL_COUNT = int(os.environ.get("BLENDING_V240_VISUAL_COUNT", "20"))
 USER_V241_DIAGNOSTIC_ONLY = os.environ.get("BLENDING_V241_DIAGNOSTIC_ONLY", "0") == "1"
 USER_V2411_DIAGNOSTIC_ONLY = os.environ.get("BLENDING_V2411_DIAGNOSTIC_ONLY", "0") == "1"
+USER_V243_DIAGNOSTIC_ONLY = os.environ.get("BLENDING_V243_DIAGNOSTIC_ONLY", "0") == "1"
 USER_V242_DIAGNOSTIC_ONLY = os.environ.get("BLENDING_V242_DIAGNOSTIC_ONLY", "0") == "1"
-USER_V2412_DIAGNOSTIC_ONLY = (os.environ.get("BLENDING_V2412_DIAGNOSTIC_ONLY", "0") == "1" or USER_V242_DIAGNOSTIC_ONLY)
+USER_V2412_DIAGNOSTIC_ONLY = (os.environ.get("BLENDING_V2412_DIAGNOSTIC_ONLY", "0") == "1" or USER_V242_DIAGNOSTIC_ONLY or USER_V243_DIAGNOSTIC_ONLY)
 USER_V241_PALETTE_MAD_SCALE = float(os.environ.get("BLENDING_V241_PALETTE_MAD_SCALE", "3.5"))
 USER_V241_PALETTE_MIN_SUPPORT = int(os.environ.get("BLENDING_V241_PALETTE_MIN_SUPPORT", "16"))
 USER_V241_ILLUMINATION_RADIUS = int(os.environ.get("BLENDING_V241_ILLUMINATION_RADIUS", "11"))
@@ -533,6 +536,7 @@ V241_COLOR_CACHE_SUFFIX = "_v241_stable_hue_gamut_face_guard"
 V2411_COLOR_CACHE_SUFFIX = "_v2411_correctness_fix"
 V2412_COLOR_CACHE_SUFFIX = "_v2412_final_correctness_fix"
 V242_COLOR_CACHE_SUFFIX = "_v242_target_hair_core_ownership_new_growth"
+V243_COLOR_CACHE_SUFFIX = "_v243_confidence_core_strand_matte_photometric"
 
 USER_USE_FID = False
 USER_FID_CACHE = "input/fid.pkl"
@@ -671,7 +675,9 @@ def role_key(role: str, stem: str) -> str:
 def fs_cache_name(role: str, stem: str) -> str:
     suffix = ""
     if role == "color":
-        if USER_V242_DIAGNOSTIC_ONLY:
+        if USER_V243_DIAGNOSTIC_ONLY:
+            suffix = V243_COLOR_CACHE_SUFFIX
+        elif USER_V242_DIAGNOSTIC_ONLY:
             suffix = V242_COLOR_CACHE_SUFFIX
         elif USER_V2412_DIAGNOSTIC_ONLY:
             suffix = V2412_COLOR_CACHE_SUFFIX
@@ -764,8 +770,9 @@ def build_cache_model() -> HairFast_v8:
     model_args.v237_enabled = bool(USER_V237_DIAGNOSTIC_ONLY)
     model_args.v238_enabled = bool(USER_V238_DIAGNOSTIC_ONLY)
     model_args.v239_enabled = bool(USER_V239_DIAGNOSTIC_ONLY)
-    model_args.v241_enabled = bool(USER_V241_DIAGNOSTIC_ONLY or USER_V2411_DIAGNOSTIC_ONLY or USER_V2412_DIAGNOSTIC_ONLY)
+    model_args.v241_enabled = bool(USER_V241_DIAGNOSTIC_ONLY or USER_V2411_DIAGNOSTIC_ONLY or USER_V2412_DIAGNOSTIC_ONLY or USER_V243_DIAGNOSTIC_ONLY)
     model_args.v2412_enabled = bool(USER_V2412_DIAGNOSTIC_ONLY)
+    model_args.v243_enabled = bool(USER_V243_DIAGNOSTIC_ONLY)
     model_args.v240_enabled = bool(USER_V240_DIAGNOSTIC_ONLY)
     # V2.35+ cache generation must use the same hair-only color preprocessing
     # as runtime inference. Other modes retain the legacy full-image encoder.
@@ -1319,7 +1326,7 @@ class BlendingTrainerV8:
             matte_ring_radius=USER_V240_MATTE_RING_RADIUS,
             face_guard=USER_V240_FACE_GUARD,
         )
-        transfer_cls = HairLocalRecompositionV842 if USER_V2412_DIAGNOSTIC_ONLY else HairLocalRecompositionV841
+        transfer_cls = HairLocalRecompositionV843 if USER_V243_DIAGNOSTIC_ONLY else HairLocalRecompositionV842 if USER_V2412_DIAGNOSTIC_ONLY else HairLocalRecompositionV841
         self.v241_transfer = transfer_cls(
             palette_mad_scale=USER_V241_PALETTE_MAD_SCALE,
             palette_min_support=USER_V241_PALETTE_MIN_SUPPORT,
@@ -7035,23 +7042,24 @@ Human review remains required; record it in `visual_review/v228_visual_review.js
     @torch.inference_mode()
     def run_v238_diagnostic(self):
         """Validate target-hair occlusion ownership and continuous final matte."""
-        is_v242 = USER_V242_DIAGNOSTIC_ONLY
-        is_v2412 = USER_V2412_DIAGNOSTIC_ONLY and not is_v242
+        is_v243 = USER_V243_DIAGNOSTIC_ONLY
+        is_v242 = USER_V242_DIAGNOSTIC_ONLY and not is_v243
+        is_v2412 = USER_V2412_DIAGNOSTIC_ONLY and not is_v242 and not is_v243
         is_v2411 = USER_V2411_DIAGNOSTIC_ONLY
-        is_v241 = (is_v242 or USER_V241_DIAGNOSTIC_ONLY or is_v2411 or is_v2412)
+        is_v241 = (is_v243 or is_v242 or USER_V241_DIAGNOSTIC_ONLY or is_v2411 or is_v2412)
         is_v240 = USER_V240_DIAGNOSTIC_ONLY and not is_v241
         is_v239 = USER_V239_DIAGNOSTIC_ONLY and not is_v240 and not is_v241
-        version = "v242" if is_v242 else "v2412" if is_v2412 else "v2411" if is_v2411 else "v241" if is_v241 else "v240" if is_v240 else "v239" if is_v239 else "v238"
+        version = "v243" if is_v243 else "v242" if is_v242 else "v2412" if is_v2412 else "v2411" if is_v2411 else "v241" if is_v241 else "v240" if is_v240 else "v239" if is_v239 else "v238"
         root = Path("res") / version
         active_root = ACTIVE_OUTPUT_DIR / version
-        for path in (root, root / "debug", root / "comparisons" / "visual", root / "comparisons" / "diagnostic", root / "comparisons" / "texture", root / "comparisons" / "tone", root / "comparisons" / "hue", root / "metrics"):
+        for path in (root, root / "debug", root / "comparisons" / "visual", root / "comparisons" / "diagnostic", root / "comparisons" / "texture", root / "comparisons" / "tone", root / "comparisons" / "hue", root / "comparisons" / "matte", root / "comparisons" / "photometric", root / "comparisons" / "ownership", root / "metrics"):
             path.mkdir(parents=True, exist_ok=True)
         records, visual_ids = [], []
         visual_index = 0
         post_process = PostProcessModel().to(self.device).eval()
         pp_state = torch.load(USER_V227_PP_CHECKPOINT, map_location=self.device)
         post_process.load_state_dict(pp_state["model_state_dict"])
-        diagnostic_label = "V2.42" if is_v242 else "V2.41.2" if is_v2412 else "V2.41.1" if is_v2411 else f"V2.{41 if is_v241 else 40 if is_v240 else 39 if is_v239 else 38}"
+        diagnostic_label = "V2.43" if is_v243 else "V2.42" if is_v242 else "V2.41.2" if is_v2412 else "V2.41.1" if is_v2411 else f"V2.{41 if is_v241 else 40 if is_v240 else 39 if is_v239 else 38}"
         for batch in tqdm(self.val_loader, desc=f"{diagnostic_label} texture-preserving recolor diagnostic", leave=False):
             prepared = self.prepare_batch(batch)
             if prepared is None:
@@ -7095,6 +7103,22 @@ Human review remains required; record it in `visual_review/v228_visual_review.js
                     target_hair_transition=aux.get("target_hair_transition"),
                     face_boundary_alpha_jump_map=aux.get("face_boundary_alpha_jump_map"),
                 ))
+            if is_v243:
+                metrics.update(v243_metric_tensors(
+                    target_hair_mask=runtime["coarse_target_hair_mask"],
+                    coarse_target_hair_mask=runtime["coarse_target_hair_mask"],
+                    hair_alpha_final=aux["target_hair_alpha_final"],
+                    safe_dense_core=aux["safe_dense_core"],
+                    uncertain_core=aux["uncertain_core"],
+                    source_skin_mask=runtime["source_skin_mask"],
+                    anchor_hair_evidence=aux["anchor_hair_evidence"],
+                    strand_structure_confidence=aux["strand_structure_confidence"],
+                    hair_support=aux.get("hair_support"),
+                    flyaway_candidate=aux.get("flyaway_candidate"),
+                    final_l=aux.get("final_l"),
+                    reference_chroma=aux.get("new_chroma"),
+                    scene_illumination_ab=aux.get("scene_illumination_ab"),
+                ))
             target_ab_preview = torch.cat(
                 (aux["target_ab"], torch.zeros_like(aux["target_ab"][:, :1])), dim=1
             ).clamp(-100, 100) / 50
@@ -7136,6 +7160,30 @@ Human review remains required; record it in `visual_review/v228_visual_review.js
                             mask_to_preview((aux["face_overlap_contamination_risk"][index:index + 1] > 0.65).float()),
                             mask_to_preview(aux["gamut_scale_map"][index:index + 1]),
                         ])
+                        if is_v243:
+                            save_preview(root / "comparisons" / "matte" / f"sample_{visual_index:03d}.png", [
+                                prepared["face_i"][index:index + 1],
+                                mask_to_preview(runtime["coarse_target_hair_mask"][index:index + 1]),
+                                mask_to_preview(aux["dense_core_confidence"][index:index + 1]),
+                                mask_to_preview(aux["strand_structure_confidence"][index:index + 1]),
+                                mask_to_preview(aux["flyaway_candidate"][index:index + 1]),
+                                mask_to_preview(aux["target_hair_alpha_final"][index:index + 1]),
+                                final[index:index + 1] * 2 - 1,
+                            ])
+                            save_preview(root / "comparisons" / "photometric" / f"sample_{visual_index:03d}.png", [
+                                prepared["color_i"][index:index + 1],
+                                anchor[index:index + 1] * 2 - 1,
+                                aux["new_hair_rgb"][index:index + 1] * 2 - 1,
+                                mask_to_preview(aux["shadow_chroma_scale"][index:index + 1]),
+                                mask_to_preview(aux["highlight_chroma_scale"][index:index + 1]),
+                                final[index:index + 1] * 2 - 1,
+                            ])
+                            save_preview(root / "comparisons" / "ownership" / f"sample_{visual_index:03d}.png", [
+                                mask_to_preview(aux["safe_dense_core"][index:index + 1]),
+                                mask_to_preview(aux["uncertain_core"][index:index + 1]),
+                                mask_to_preview(aux["skin_conflict"][index:index + 1]),
+                                mask_to_preview(aux["alpha_after_guard"][index:index + 1]),
+                            ])
                     elif is_v240:
                         save_preview(root / "comparisons" / "texture" / f"sample_{visual_index:03d}.png", [
                             prepared["color_i"][index:index + 1], anchor[index:index + 1] * 2 - 1,
@@ -7243,11 +7291,34 @@ Human review remains required; record it in `visual_review/v228_visual_review.js
                             ("final_l.png", mask_to_preview(aux["final_l"][index:index + 1] / 100.0)),
                             ("gamut_chroma_scale.png", mask_to_preview(aux["gamut_chroma_scale"][index:index + 1].expand(-1, -1, base.shape[-2], base.shape[-1]))),
                         )
+                    if is_v243:
+                        debug_values = debug_values + (
+                            ("distance_prior.png", mask_to_preview(aux["distance_prior"][index:index + 1])),
+                            ("strand_structure_confidence.png", mask_to_preview(aux["strand_structure_confidence"][index:index + 1])),
+                            ("skin_conflict.png", mask_to_preview(aux["skin_conflict"][index:index + 1])),
+                            ("dense_core_confidence.png", mask_to_preview(aux["dense_core_confidence"][index:index + 1])),
+                            ("safe_dense_core.png", mask_to_preview(aux["safe_dense_core"][index:index + 1])),
+                            ("uncertain_core.png", mask_to_preview(aux["uncertain_core"][index:index + 1])),
+                            ("hair_support.png", mask_to_preview(aux["hair_support"][index:index + 1])),
+                            ("outside_band.png", mask_to_preview(aux["outside_band"][index:index + 1])),
+                            ("flyaway_candidate.png", mask_to_preview(aux["flyaway_candidate"][index:index + 1])),
+                            ("transition_alpha.png", mask_to_preview(aux["transition_alpha"][index:index + 1])),
+                            ("flyaway_alpha.png", mask_to_preview(aux["flyaway_alpha"][index:index + 1])),
+                            ("alpha_after_guard.png", mask_to_preview(aux["alpha_after_guard"][index:index + 1])),
+                            ("scene_illumination_ab.png", mask_to_preview(aux["scene_illumination_ab"][index:index + 1].norm(dim=1, keepdim=True) / 50.0)),
+                            ("scene_illumination_reliability.png", mask_to_preview(aux["scene_illumination_reliability"][index:index + 1])),
+                            ("shadow_chroma_scale.png", mask_to_preview(aux["shadow_chroma_scale"][index:index + 1])),
+                            ("highlight_chroma_scale.png", mask_to_preview(aux["highlight_chroma_scale"][index:index + 1])),
+                            ("plausibility_scale.png", mask_to_preview(aux["plausibility_scale"][index:index + 1])),
+                            ("gamut_precondition_scale.png", mask_to_preview(aux["gamut_precondition_scale"][index:index + 1])),
+                            ("new_hair_l_low.png", mask_to_preview(aux["new_hair_l_low"][index:index + 1] / 100.0)),
+                            ("existing_hair_l_low.png", mask_to_preview(aux["existing_hair_l_low"][index:index + 1] / 100.0)),
+                        )
                     for filename, value in debug_values:
                         save_preview(debug / filename, value)
                     visual_index += 1
         if not records:
-            payload = {"version": "v2.42" if is_v242 else "v2.41.2" if is_v2412 else "v2.41.1" if is_v2411 else f"v2.{41 if is_v241 else 40 if is_v240 else 39 if is_v239 else 38}", "automatic_decision": "V242_NO_VALID_SAMPLES" if is_v242 else f"V{41 if is_v241 else 40 if is_v240 else 39 if is_v239 else 38}_NO_VALID_SAMPLES"}
+            payload = {"version": "v2.43" if is_v243 else "v2.42" if is_v242 else "v2.41.2" if is_v2412 else "v2.41.1" if is_v2411 else f"v2.{41 if is_v241 else 40 if is_v240 else 39 if is_v239 else 38}", "automatic_decision": "V243_NO_VALID_SAMPLES" if is_v243 else "V242_NO_VALID_SAMPLES" if is_v242 else f"V{41 if is_v241 else 40 if is_v240 else 39 if is_v239 else 38}_NO_VALID_SAMPLES"}
         else:
             keys = sorted({key for row in records for key in row if key != "sample_id"})
             summary = {f"median_{key}": float(np.median([row[key] for row in records])) for key in keys}
@@ -7266,7 +7337,7 @@ Human review remains required; record it in `visual_review/v228_visual_review.js
             failed = []
             if is_v2412:
                 failed.extend(valid_failures)
-            gates = () if (is_v2412 or is_v242) else (
+            gates = () if (is_v2412 or is_v242 or is_v243) else (
                 ("median_face_rgb_change_from_base", 0.01, "V238_FACE_BASE_PRESERVATION_FAIL", lambda x, t: x > t),
                 ("median_background_rgb_change_from_base", 0.01, "V238_BACKGROUND_BASE_PRESERVATION_FAIL", lambda x, t: x > t),
                 ("median_hair_reference_progress", 0.60, "V238_HAIR_COLOR_FIDELITY_FAIL", lambda x, t: x < t),
@@ -7274,7 +7345,14 @@ Human review remains required; record it in `visual_review/v228_visual_review.js
                 ("median_hair_low_transfer_fraction", 0.50, "V238_LOW_TRANSFER_FAIL", lambda x, t: x > t),
                 ("median_hair_core_full_transfer_fraction", 0.20, "V238_CORE_TRANSFER_FAIL", lambda x, t: x < t),
             )
-            if is_v2412:
+            if is_v243:
+                gates = gates + (
+                    ("median_safe_dense_core_alpha", 0.85, "V243_SAFE_CORE_COVERAGE_FAIL", lambda x, t: x < t),
+                    ("median_skin_core_false_positive_fraction", 0.05, "V243_SKIN_CORE_FALSE_POSITIVE_FAIL", lambda x, t: x > t),
+                    ("median_shadow_chroma_ratio", 0.90, "V243_SHADOW_CHROMA_FAIL", lambda x, t: x > t),
+                    ("median_highlight_chroma_ratio", 0.95, "V243_HIGHLIGHT_CHROMA_FAIL", lambda x, t: x > t),
+                )
+            elif is_v2412:
                 gates = gates + (
                     ("median_visible_face_rgb_change_from_base", 0.010, "V2412_VISIBLE_FACE_PRESERVATION_FAIL", lambda x, t: x > t),
                     ("median_visible_skin_rgb_change_from_base", 0.010, "V2412_VISIBLE_SKIN_PRESERVATION_FAIL", lambda x, t: x > t),
@@ -7340,14 +7418,14 @@ Human review remains required; record it in `visual_review/v228_visual_review.js
                 if bad(summary.get(key, 0.0), threshold):
                     failed.append(name)
             payload = {
-                "version": "v2.42" if is_v242 else "v2.41.2" if is_v2412 else "v2.41.1" if is_v2411 else f"v2.{41 if is_v241 else 40 if is_v240 else 39 if is_v239 else 38}", "training": False,
-                "mode": "TARGET_HAIR_CORE_OWNERSHIP_NEW_GROWTH" if is_v242 else "FINAL_CORRECTNESS_EVAL_ALIGNMENT_FIX" if is_v2412 else "STABLE_HUE_GAMUT_FACE_GUARD_CORRECTNESS_FIX" if is_v2411 else "STABLE_HUE_GAMUT_FACE_GUARD" if is_v241 else "TEXTURE_PRESERVING_MULTIBAND_RECOLOR" if is_v240 else "REFERENCE_HAIR_INTRINSIC_TONE_CALIBRATION" if is_v239 else "TARGET_HAIR_OCCLUSION_AWARE_MATTE",
+                "version": "v2.43" if is_v243 else "v2.42" if is_v242 else "v2.41.2" if is_v2412 else "v2.41.1" if is_v2411 else f"v2.{41 if is_v241 else 40 if is_v240 else 39 if is_v239 else 38}", "training": False,
+                "mode": "CONFIDENCE_CORE_STRAND_MATTE_PHOTOMETRIC" if is_v243 else "TARGET_HAIR_CORE_OWNERSHIP_NEW_GROWTH" if is_v242 else "FINAL_CORRECTNESS_EVAL_ALIGNMENT_FIX" if is_v2412 else "STABLE_HUE_GAMUT_FACE_GUARD_CORRECTNESS_FIX" if is_v2411 else "STABLE_HUE_GAMUT_FACE_GUARD" if is_v241 else "TEXTURE_PRESERVING_MULTIBAND_RECOLOR" if is_v240 else "REFERENCE_HAIR_INTRINSIC_TONE_CALIBRATION" if is_v239 else "TARGET_HAIR_OCCLUSION_AWARE_MATTE",
                 "non_hair_owner": "BASE_SOURCE_PRESERVED",
                 "topology_owner": "TARGET_HAIR_COARSE_PRIOR",
                 "occlusion_owner": "TARGET_HAIR_OCCLUSION_RESOLVER",
                 "matte_owner": "HIGH_RES_RULE_BASED_REFINER",
                 "summary": summary, "failed_gates": failed,
-                "automatic_decision": failed[0] if failed else ("V242_READY_FOR_VISUAL_REVIEW" if is_v242 else "V2412_READY_FOR_VISUAL_REVIEW" if is_v2412 else "V2411_READY_FOR_VISUAL_REVIEW" if is_v2411 else "V241_READY_FOR_VISUAL_REVIEW" if is_v241 else "V240_READY_FOR_VISUAL_REVIEW" if is_v240 else "V239_READY_FOR_VISUAL_REVIEW" if is_v239 else "V238_READY_FOR_VISUAL_REVIEW"),
+                "automatic_decision": failed[0] if failed else ("V243_READY_FOR_VISUAL_REVIEW" if is_v243 else "V242_READY_FOR_VISUAL_REVIEW" if is_v242 else "V2412_READY_FOR_VISUAL_REVIEW" if is_v2412 else "V2411_READY_FOR_VISUAL_REVIEW" if is_v2411 else "V241_READY_FOR_VISUAL_REVIEW" if is_v241 else "V240_READY_FOR_VISUAL_REVIEW" if is_v240 else "V239_READY_FOR_VISUAL_REVIEW" if is_v239 else "V238_READY_FOR_VISUAL_REVIEW"),
             }
             (root / "per_sample.jsonl").write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in records) + "\n", encoding="utf-8")
             (root / "metrics" / f"{version}_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -8709,7 +8787,10 @@ Human review remains required; record it in `visual_review/v228_visual_review.js
             raise RuntimeError(
                 "V2.31 diagnostic-only mode does not accept a resume checkpoint"
             )
-        if USER_V242_DIAGNOSTIC_ONLY:
+        if USER_V243_DIAGNOSTIC_ONLY:
+            summary = self.run_v2412_diagnostic()
+            history = [{"phase": "v243_confidence_core_strand_matte_photometric_diagnostic_only", **summary}]
+        elif USER_V242_DIAGNOSTIC_ONLY:
             summary = self.run_v2412_diagnostic()
             history = [{"phase": "v242_target_hair_core_ownership_new_growth_diagnostic_only", **summary}]
         elif USER_V2412_DIAGNOSTIC_ONLY:
@@ -8758,7 +8839,7 @@ Human review remains required; record it in `visual_review/v228_visual_review.js
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, "w", encoding="utf-8") as handle:
                 json.dump(history, handle, ensure_ascii=False, indent=2, allow_nan=False)
-        diagnostic_name = "v242" if USER_V242_DIAGNOSTIC_ONLY else "v2412" if USER_V2412_DIAGNOSTIC_ONLY else "v2411" if USER_V2411_DIAGNOSTIC_ONLY else "v241" if USER_V241_DIAGNOSTIC_ONLY else "v240" if USER_V240_DIAGNOSTIC_ONLY else "v239" if USER_V239_DIAGNOSTIC_ONLY else "v238" if USER_V238_DIAGNOSTIC_ONLY else "v237" if USER_V237_DIAGNOSTIC_ONLY else "v236" if USER_V236_DIAGNOSTIC_ONLY else "v235" if USER_V235_DIAGNOSTIC_ONLY else "v234" if USER_V234_DIAGNOSTIC_ONLY else "v233_diagnostic" if USER_V233_DIAGNOSTIC_ONLY else "v232_diagnostic" if USER_V232_DIAGNOSTIC_ONLY else "v231_diagnostic"
+        diagnostic_name = "v243" if USER_V243_DIAGNOSTIC_ONLY else "v242" if USER_V242_DIAGNOSTIC_ONLY else "v2412" if USER_V2412_DIAGNOSTIC_ONLY else "v2411" if USER_V2411_DIAGNOSTIC_ONLY else "v241" if USER_V241_DIAGNOSTIC_ONLY else "v240" if USER_V240_DIAGNOSTIC_ONLY else "v239" if USER_V239_DIAGNOSTIC_ONLY else "v238" if USER_V238_DIAGNOSTIC_ONLY else "v237" if USER_V237_DIAGNOSTIC_ONLY else "v236" if USER_V236_DIAGNOSTIC_ONLY else "v235" if USER_V235_DIAGNOSTIC_ONLY else "v234" if USER_V234_DIAGNOSTIC_ONLY else "v233_diagnostic" if USER_V233_DIAGNOSTIC_ONLY else "v232_diagnostic" if USER_V232_DIAGNOSTIC_ONLY else "v231_diagnostic"
         source_comparisons = ACTIVE_OUTPUT_DIR / diagnostic_name / "comparisons"
         comparisons_root = ACTIVE_OUTPUT_DIR / "comparisons"
         if source_comparisons.exists():
@@ -8786,7 +8867,7 @@ def main():
     ensure_dataset_cache_v8(triplets)
     teacher_cache_path = ACTIVE_DATASET_DIR / USER_TEACHER_CACHE_NAME
     teacher_records = None
-    active_version = "V2.42" if USER_V242_DIAGNOSTIC_ONLY else "V2.41.2" if USER_V2412_DIAGNOSTIC_ONLY else "V2.41.1" if USER_V2411_DIAGNOSTIC_ONLY else "V2.41" if USER_V241_DIAGNOSTIC_ONLY else "V2.40" if USER_V240_DIAGNOSTIC_ONLY else "V2.39" if USER_V239_DIAGNOSTIC_ONLY else "V2.38" if USER_V238_DIAGNOSTIC_ONLY else "V2.37" if USER_V237_DIAGNOSTIC_ONLY else "V2.36" if USER_V236_DIAGNOSTIC_ONLY else "V2.35" if USER_V235_DIAGNOSTIC_ONLY else "V2.34" if USER_V234_DIAGNOSTIC_ONLY else "V2.33" if USER_V233_DIAGNOSTIC_ONLY else "V2.32" if USER_V232_DIAGNOSTIC_ONLY else "V2.31"
+    active_version = "V2.43" if USER_V243_DIAGNOSTIC_ONLY else "V2.42" if USER_V242_DIAGNOSTIC_ONLY else "V2.41.2" if USER_V2412_DIAGNOSTIC_ONLY else "V2.41.1" if USER_V2411_DIAGNOSTIC_ONLY else "V2.41" if USER_V241_DIAGNOSTIC_ONLY else "V2.40" if USER_V240_DIAGNOSTIC_ONLY else "V2.39" if USER_V239_DIAGNOSTIC_ONLY else "V2.38" if USER_V238_DIAGNOSTIC_ONLY else "V2.37" if USER_V237_DIAGNOSTIC_ONLY else "V2.36" if USER_V236_DIAGNOSTIC_ONLY else "V2.35" if USER_V235_DIAGNOSTIC_ONLY else "V2.34" if USER_V234_DIAGNOSTIC_ONLY else "V2.33" if USER_V233_DIAGNOSTIC_ONLY else "V2.32" if USER_V232_DIAGNOSTIC_ONLY else "V2.31"
     print(f"[{active_version}] deterministic validation only; no training")
     print(f"[{active_version}] teacher alpha/controller disabled")
     train_exps, val_exps = train_test_split(triplets, test_size=ACTIVE_VAL_SIZE, random_state=USER_RANDOM_SEED)
@@ -8828,7 +8909,16 @@ def main():
         USER_V227_BASE_CHECKPOINT, device
     )
     trainer = BlendingTrainerV8(model, None, train_loader, val_loader, helper)
-    if USER_V2412_DIAGNOSTIC_ONLY:
+    if USER_V243_DIAGNOSTIC_ONLY:
+        print(
+            "[V2.43] training=False\n"
+            "[V2.43] confidence_core=DISTANCE_ANCHOR_STRAND_SKIN_CONFLICT\n"
+            "[V2.43] matte=STRAND_AWARE_WITH_FLYAWAY_SUPPORT\n"
+            "[V2.43] appearance=PHOTOMETRIC_SCENE_LIGHT_REFERENCE_CHROMA\n"
+            "[V2.43] acceptance=V243_NAMESPACE",
+            file=sys.stderr,
+        )
+    elif USER_V2412_DIAGNOSTIC_ONLY:
         print(
             "[V2.41.2] training=False\n"
             "[V2.41.2] illumination_double_counting=False\n"
@@ -8985,7 +9075,15 @@ def main():
         f"[V2.31] vitmatte_path={USER_V231_VITMATTE_PATH}\n"
         f"[V2.31] base_checkpoint={USER_V227_BASE_CHECKPOINT}"
     )
-    if USER_V2412_DIAGNOSTIC_ONLY:
+    if USER_V243_DIAGNOSTIC_ONLY:
+        mode_header = "[V2.43] mode=CONFIDENCE_CORE_STRAND_MATTE_PHOTOMETRIC\n"
+        mode_details = (
+            "[V2.43] training=False\n"
+            "[V2.43] confidence_core=DISTANCE_PRIOR_PLUS_ANCHOR_EVIDENCE_PLUS_STRAND\n"
+            "[V2.43] illumination_owner=EXISTING_NEW_HAIR_SPLIT\n"
+            "[V2.43] acceptance=V243_ONLY"
+        )
+    elif USER_V2412_DIAGNOSTIC_ONLY:
         mode_header = "[V2.41.2] mode=FINAL_CORRECTNESS_EVAL_ALIGNMENT_FIX\n"
         mode_details = (
             "[V2.41.2] training=False\n"

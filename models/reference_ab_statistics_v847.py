@@ -23,8 +23,16 @@ def reference_ab_statistics(reference_rgb: torch.Tensor, reference_hair_mask: to
     median_ab = torch.stack((_median(ab[:, :1], reference_hair_mask), _median(ab[:, 1:2], reference_hair_mask)), dim=1)
     median_chroma = _median(chroma, reference_hair_mask)
     hue = torch.atan2(ab[:, 1:2], ab[:, 0:1])
-    median_hue = _median(hue, reference_hair_mask)
-    return {"reference_median_ab": median_ab, "reference_chroma_median": median_chroma, "reference_stable_hue": median_hue, "reference_stable_hue_unit": torch.stack((median_hue.cos(), median_hue.sin()), dim=1), "reference_lab": lab}
+    mask = reference_hair_mask.float().expand_as(hue)
+    cos_rows, sin_rows = [], []
+    for index in range(hue.size(0)):
+        selected = mask[index].flatten() > 0.5
+        cos_values, sin_values = hue[index].flatten().cos()[selected], hue[index].flatten().sin()[selected]
+        cos_rows.append(cos_values.mean() if cos_values.numel() else hue.new_zeros(()))
+        sin_rows.append(sin_values.mean() if sin_values.numel() else hue.new_zeros(()))
+    mean_cos, mean_sin = torch.stack(cos_rows), torch.stack(sin_rows)
+    stable_hue = torch.atan2(mean_sin, mean_cos)
+    return {"reference_median_ab": median_ab, "reference_chroma_median": median_chroma, "reference_stable_hue": stable_hue, "reference_stable_hue_unit": torch.stack((stable_hue.cos(), stable_hue.sin()), dim=1), "reference_lab": lab}
 
 
 __all__ = ["reference_ab_statistics"]

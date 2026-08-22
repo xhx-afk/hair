@@ -9,7 +9,7 @@ from models.carrier_reference_error_v847 import CarrierReferenceErrorEstimatorV8
 from models.gamut_precondition_v843 import gamut_precondition_v843
 from models.gamut_safe_lab_v841 import gamut_safe_lab_to_rgb_v841
 from models.reference_ab_statistics_v847 import reference_ab_statistics
-from models.v245_death_test_common import dilate
+from models.v245_death_test_common import erode
 from models.SG_IDCT_v16 import rgb_to_lab
 
 
@@ -28,8 +28,9 @@ def _clamp_vector(value: torch.Tensor, maximum: float) -> torch.Tensor:
 
 
 def _region_ratio(chroma: torch.Tensor, luma: torch.Tensor, mask: torch.Tensor, low: float, high: float | None = None) -> torch.Tensor:
-    q_low = torch.quantile(luma.flatten(1), luma.new_tensor(low), dim=1).view(-1, 1, 1, 1)
-    region = mask * ((luma <= q_low) if high is None else ((luma >= q_low) & (luma <= torch.quantile(luma.flatten(1), luma.new_tensor(high), dim=1).view(-1, 1, 1, 1)))).float()
+    q_low = _masked_q(luma, mask, low).view(-1, 1, 1, 1)
+    indicator = luma <= q_low if high is None else ((luma >= q_low) & (luma <= _masked_q(luma, mask, high).view(-1, 1, 1, 1)))
+    region = mask.float() * indicator.float()
     return (chroma * region).flatten(1).sum(1) / region.flatten(1).sum(1).clamp_min(1.0)
 
 
@@ -58,6 +59,7 @@ class HairPhotometricResidualV847:
                  strong_anchor_rgb: torch.Tensor | None = None,
                  source_hair_l: torch.Tensor | None = None,
                  reference_l: torch.Tensor | None = None,
+                 carrier_stats_mask: torch.Tensor | None = None,
                  enable_l: bool = True, enable_ab: bool = True,
                  enable_shading: bool = False, enable_plausibility: bool = False,
                  return_aux: bool = False) -> tuple[torch.Tensor, dict[str, torch.Tensor]] | torch.Tensor:
@@ -65,7 +67,19 @@ class HairPhotometricResidualV847:
         carrier_l, carrier_ab = carrier_lab[:, :1], carrier_lab[:, 1:]
         target_soft = _blur(target_hair_mask.float().clamp(0, 1), 5).clamp(0, 1)
         hair_apply = target_soft * (target_soft >= 0.01).float()
-        error = self.estimator(carrier_rgb=carrier_rgb, reference_rgb=reference_rgb, carrier_hair_mask=target_hair_mask, reference_hair_mask=reference_hair_mask)
+        supplied_stats = carrier_stats_mask is not None
+        trusted_count = carrier_stats_mask.float().flatten(1).gt(.5).sum(1) if supplied_stats else carrier_rgb.new_zeros(carrier_rgb.size(0))
+        stats_mask_source = "trusted_core" if supplied_stats and bool(torch.all(trusted_count >= 256)) else "eroded_target"
+        stats_mask = carrier_stats_mask.float().clamp(0, 1) if stats_mask_source == "trusted_core" else erode(target_hair_mask.float().clamp(0, 1), 4)
+        error = self.estimator(carrier_rgb=carrier_rgb, reference_rgb=reference_rgb, carrier_hair_mask=stats_mask, reference_hair_mask=reference_hair_mask)
+        # A sparse trusted core is not allowed to produce a gate.  The eroded
+        # target is only a deterministic statistics fallback for diagnostics.
+        gate_metric_valid = (trusted_count >= 256).float() if supplied_stats else error["gate_metric_valid"]
+        if supplied_stats:
+            invalid = gate_metric_valid < .5
+            for key in ("l_gate_strength", "ab_gate_strength"):
+                error[key] = torch.where(invalid, torch.zeros_like(error[key]), error[key])
+            error["no_op"] = torch.where(invalid, torch.ones_like(error["no_op"]), error["no_op"])
         carrier_l_low = _blur(carrier_l, self.low_radius)
         carrier_center = error["carrier_l_q50"].view(-1, 1, 1, 1)
         reference_center = error["reference_l_q50"].view(-1, 1, 1, 1)
@@ -94,17 +108,20 @@ class HairPhotometricResidualV847:
 
         carrier_shadow = _region_ratio(carrier_ab.norm(dim=1, keepdim=True), carrier_l, target_hair_mask, .20)
         carrier_mid = _region_ratio(carrier_ab.norm(dim=1, keepdim=True), carrier_l, target_hair_mask, .35, .65)
-        carrier_high = (carrier_ab.norm(dim=1, keepdim=True) * target_hair_mask * (carrier_l >= _masked_q(carrier_l, target_hair_mask, .80).view(-1, 1, 1, 1)).float()).flatten(1).sum(1) / target_hair_mask.flatten(1).sum(1).clamp_min(1.0)
+        highlight_region = target_hair_mask.float() * (carrier_l >= _masked_q(carrier_l, target_hair_mask, .80).view(-1, 1, 1, 1)).float()
+        carrier_high = (carrier_ab.norm(dim=1, keepdim=True) * highlight_region).flatten(1).sum(1) / highlight_region.flatten(1).sum(1).clamp_min(1.0)
         shadow_over = (carrier_shadow / carrier_mid.clamp_min(1e-4) - .90).clamp_min(0.0)
         highlight_over = (carrier_high / carrier_mid.clamp_min(1e-4) - 1.0).clamp_min(0.0)
-        shading_gate = torch.maximum((shadow_over / .30).clamp(0, 1), (highlight_over / .30).clamp(0, 1)) if enable_shading else torch.zeros_like(shadow_over)
-        shading_gate = shading_gate.view(-1, 1, 1, 1)
+        shadow_gate = (shadow_over / .30).clamp(0, 1) if enable_shading else torch.zeros_like(shadow_over)
+        highlight_gate = (highlight_over / .30).clamp(0, 1) if enable_shading else torch.zeros_like(highlight_over)
+        shading_gate = torch.maximum(shadow_gate, highlight_gate)
+        shadow_gate_map, highlight_gate_map = shadow_gate.view(-1, 1, 1, 1), highlight_gate.view(-1, 1, 1, 1)
         q20 = _masked_q(final_l, target_hair_mask, .20).view(-1, 1, 1, 1); q35 = _masked_q(final_l, target_hair_mask, .35).view(-1, 1, 1, 1); q65 = _masked_q(final_l, target_hair_mask, .65).view(-1, 1, 1, 1); q80 = _masked_q(final_l, target_hair_mask, .80).view(-1, 1, 1, 1)
         rank = ((final_l - q20) / (q80 - q20).clamp_min(1e-4)).clamp(0, 1)
         shadow_raw = .75 + .25 * ((rank - .10) / .25).clamp(0, 1)
         highlight_raw = 1.0 - .20 * ((rank - .75) / .20).clamp(0, 1)
-        shadow_scale = 1.0 + shading_gate * (shadow_raw - 1.0) * target_soft
-        highlight_scale = 1.0 + shading_gate * (highlight_raw - 1.0) * target_soft
+        shadow_scale = 1.0 + shadow_gate_map * (shadow_raw - 1.0) * target_soft
+        highlight_scale = 1.0 + highlight_gate_map * (highlight_raw - 1.0) * target_soft
         final_c = provisional_c * shadow_scale * highlight_scale
         plausibility_gate = torch.zeros_like(shading_gate)
         plausibility = torch.ones_like(final_l)
@@ -124,7 +141,12 @@ class HairPhotometricResidualV847:
             pixels = delta_l[index].abs().flatten()[target_soft[index].flatten() > .5]
             l_pixels.append(torch.quantile(pixels, delta_l.new_tensor(.90)) if pixels.numel() else delta_l.new_zeros(()))
         l_delta_p90 = torch.stack(l_pixels)
-        aux = {**error, "carrier_l": carrier_l, "carrier_l_low": carrier_l_low, "desired_l_low": desired_l_low, "delta_l_low_raw": delta_l_raw, "delta_l": delta_l, "gated_delta_l": gated_delta_l, "final_l": final_l, "carrier_ab": carrier_ab, "carrier_ab_low": carrier_ab_low, "carrier_ab_detail": carrier_ab_detail, "delta_ab_center": delta_ab_center, "final_ab_low": final_ab_low, "provisional_ab": provisional_ab, "final_ab": conditioned[:, 1:], "shadow_chroma_scale": shadow_scale, "highlight_chroma_scale": highlight_scale, "shading_gate_strength": shading_gate, "plausibility_scale": plausibility, "plausibility_gate_strength": plausibility_gate, "target_hair_soft": target_soft, "hair_apply_mask": hair_apply, "l_delta_clamp_fraction": (delta_l.abs() >= self.max_delta_l - 1e-5).float().flatten(1).sum(1) / target_soft.flatten(1).sum(1).clamp_min(1.0), "l_delta_p90": l_delta_p90, "l_delta_mean_abs": (delta_l.abs() * target_soft).flatten(1).sum(1) / target_soft.flatten(1).sum(1).clamp_min(1.0), "ab_correction_magnitude": delta_ab_center.norm(dim=1).flatten(), "total_gamut_scale": (pre_scale * gamut_aux["gamut_scale_map"]).clamp(0, 1), "pre_gamut_scale": pre_scale, "final_gamut_scale": gamut_aux["gamut_scale_map"], "candidate_rgb": candidate_rgb, "scene_tint_enabled": torch.tensor(False, device=carrier_rgb.device), **gamut_aux}
+        hair_region = target_soft > .5
+        clamp_mask = (delta_l.abs() >= self.max_delta_l - 1e-5) & hair_region
+        aux = {**error, "stats_mask_source": stats_mask_source, "stats_mask": stats_mask, "stats_mask_pixel_count": stats_mask.flatten(1).gt(.5).sum(1), "gate_metric_valid": gate_metric_valid, "carrier_l": carrier_l, "carrier_l_low": carrier_l_low, "desired_l_low": desired_l_low, "delta_l_low_raw": delta_l_raw, "delta_l": delta_l, "gated_delta_l": gated_delta_l, "final_l": final_l, "carrier_ab": carrier_ab, "carrier_ab_low": carrier_ab_low, "carrier_ab_detail": carrier_ab_detail, "delta_ab_center": delta_ab_center, "final_ab_low": final_ab_low, "provisional_ab": provisional_ab, "final_ab": conditioned[:, 1:], "shadow_chroma_scale": shadow_scale, "highlight_chroma_scale": highlight_scale, "shadow_gate_strength": shadow_gate_map, "highlight_gate_strength": highlight_gate_map, "shading_gate_strength": shading_gate, "plausibility_scale": plausibility, "plausibility_gate_strength": plausibility_gate, "target_hair_soft": target_soft, "hair_apply_mask": hair_apply, "l_delta_clamp_fraction": clamp_mask.flatten(1).sum(1) / hair_region.flatten(1).sum(1).clamp_min(1.0), "l_delta_p90": l_delta_p90, "l_delta_mean_abs": (delta_l.abs() * hair_region).flatten(1).sum(1) / hair_region.flatten(1).sum(1).clamp_min(1.0), "ab_correction_magnitude": delta_ab_center.norm(dim=1).flatten(), "total_gamut_scale": (pre_scale * gamut_aux["gamut_scale_map"]).clamp(0, 1), "pre_gamut_scale": pre_scale, "final_gamut_scale": gamut_aux["gamut_scale_map"], "candidate_rgb": candidate_rgb, "scene_tint_enabled": torch.tensor(False, device=carrier_rgb.device), **gamut_aux}
+        if not (enable_l or enable_ab or enable_shading or enable_plausibility):
+            candidate_rgb = carrier_rgb.clone()
+            aux.update({"final_l": carrier_l, "final_ab": carrier_ab, "final_ab_low": carrier_ab_low, "provisional_ab": carrier_ab, "candidate_rgb": candidate_rgb, "shadow_chroma_scale": torch.ones_like(shadow_scale), "highlight_chroma_scale": torch.ones_like(highlight_scale), "plausibility_scale": torch.ones_like(plausibility), "total_gamut_scale": torch.ones_like(aux["total_gamut_scale"]), "pre_gamut_scale": torch.ones_like(aux["pre_gamut_scale"]), "final_gamut_scale": torch.ones_like(aux["final_gamut_scale"]), "no_op": torch.ones_like(error["no_op"])})
         return (candidate_rgb, aux) if return_aux else candidate_rgb
 
 

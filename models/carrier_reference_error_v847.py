@@ -53,9 +53,10 @@ class CarrierReferenceErrorEstimatorV847:
         ab_gate = _smoothstep(ab_combined, 2.0, 8.0)
         ab_gate = torch.where(reference_chroma >= 25.0, ab_gate * .60, ab_gate)
         ab_gate = torch.where((reference_chroma < 12.0) & (hue_valid), ab_gate.clamp(max=.70), ab_gate)
+        gate_metric_valid = (carrier_hair_mask.float().flatten(1).gt(.5).sum(1) >= 256).float()
         no_op = (l_error_q50 < 2.5) & (ab_error < 2.0) & (chroma_error < 2.0) & ((~hue_valid) | (hue_error < 2.0))
         zero = torch.zeros_like(l_gate)
-        return {**carrier_q, **reference_q, "carrier_median_ab": carrier_median_ab, "reference_median_ab": reference_median_ab, "carrier_chroma_median": carrier_chroma, "reference_chroma_median": reference_chroma, "carrier_hue": carrier_hue, "reference_hue": reference_hue, "l_error_q50": l_error_q50, "l_distribution_error": l_distribution_error, "ab_error": ab_error, "chroma_error": chroma_error, "hue_error_deg": hue_error, "hue_metric_valid": hue_valid.float(), "l_gate_strength": torch.where(no_op, zero, l_gate), "ab_gate_strength": torch.where(no_op, zero, ab_gate), "shading_gate_strength": zero.clone(), "plausibility_gate_strength": zero.clone(), "no_op": no_op.float()}
+        return {**carrier_q, **reference_q, "carrier_median_ab": carrier_median_ab, "reference_median_ab": reference_median_ab, "carrier_chroma_median": carrier_chroma, "reference_chroma_median": reference_chroma, "carrier_hue": carrier_hue, "reference_hue": reference_hue, "l_error_q50": l_error_q50, "l_distribution_error": l_distribution_error, "ab_error": ab_error, "chroma_error": chroma_error, "hue_error_deg": hue_error, "hue_metric_valid": hue_valid.float(), "gate_metric_valid": gate_metric_valid, "l_gate_strength": torch.where(no_op | (gate_metric_valid < .5), zero, l_gate), "ab_gate_strength": torch.where(no_op | (gate_metric_valid < .5), zero, ab_gate), "shading_gate_strength": zero.clone(), "plausibility_gate_strength": zero.clone(), "no_op": (no_op | (gate_metric_valid < .5)).float()}
 
 
 __all__ = ["CarrierReferenceErrorEstimatorV847"]

@@ -56,6 +56,14 @@ def _save_preview(path: Path, tensors: list[torch.Tensor]) -> None:
     save_image(torch.cat(tiles, dim=3)[0], path)
 
 
+def _image(data: dict[str, object], *keys: str) -> torch.Tensor:
+    for key in keys:
+        value = data.get(key)
+        if torch.is_tensor(value):
+            return value
+    return data["base_rgb"]
+
+
 def _normalized(value: torch.Tensor, signed: bool = False) -> torch.Tensor:
     value = value.float()
     if signed: return (.5 + value / (2.0 * value.abs().flatten(1).amax(1).view(-1, 1, 1, 1).clamp_min(1e-4))).clamp(0, 1)
@@ -69,6 +77,7 @@ def main() -> None:
     from models.appearance_probe_v247 import AppearanceProbeV247
     from models.v245_death_test_common import composite, load_cache
     from utils.v247_appearance_metrics import appearance_metric_tensors, classify_components
+    from utils.v247_component_policy import build_component_policy, selected_components_for_group
     probe, records = AppearanceProbeV247(), []
     for index, row in enumerate(rows):
         data = load_cache(cache_dir, row["sample_id"]); trusted = probe.trusted_core(data["target_hair_mask"], data["anchor_hair_evidence"])
@@ -78,18 +87,28 @@ def main() -> None:
             variant = name.split("_")[0]; metrics = appearance_metric_tensors(carrier_rgb=data["carrier_rgb"], output_rgb=outputs[name], trusted_core=trusted, reference_rgb=data["color_reference_rgb"], reference_hair_mask=data["reference_hair_mask"], aux=aux[variant]); record.update({f"{variant}_{key}": _value(value) for key, value in metrics.items()}); previews.append(outputs[f"{variant}_preview"])
         visual_dir = args.output_root / "comparisons" / "visual"; probe_dir = args.output_root / "comparisons" / "appearance_probe"; freq_dir = args.output_root / "comparisons" / "frequency"; debug_dir = args.output_root / "debug" / f"{index:03d}"; visual_dir.mkdir(parents=True, exist_ok=True); probe_dir.mkdir(parents=True, exist_ok=True); freq_dir.mkdir(parents=True, exist_ok=True); debug_dir.mkdir(parents=True, exist_ok=True)
         if index < 8:
-            _save_preview(visual_dir / f"sample_{index:03d}.png", [data["base_rgb"], data["base_rgb"], data["color_reference_rgb"], data["base_rgb"], data["strong_anchor_rgb"], outputs["c5_rgb"], data["v244_alpha"], composite(data["base_rgb"], outputs["c5_rgb"], data["v244_alpha"])])
+            _save_preview(visual_dir / f"sample_{index:03d}.png", [_image(data, "source_rgb", "base_rgb"), _image(data, "shape_reference_rgb", "strong_anchor_rgb", "base_rgb"), data["color_reference_rgb"], data["base_rgb"], data["strong_anchor_rgb"], outputs["c5_rgb"], data["v244_alpha"], composite(data["base_rgb"], outputs["c5_rgb"], data["v244_alpha"])])
             _save_preview(probe_dir / f"sample_{index:03d}.png", [data["color_reference_rgb"], *previews, trusted])
             _save_preview(freq_dir / f"sample_{index:03d}.png", [_normalized(aux["c5"]["carrier_l"] / 100.0), _normalized(aux["c5"]["final_l"] / 100.0), _normalized(aux["c5"]["gated_delta_l"], True), _normalized(aux["c5"]["delta_ab_center"], True), _normalized(aux["c5"]["carrier_ab_detail"], True), _normalized(aux["c5"]["final_ab"], True), trusted])
         for key in ("carrier_l", "carrier_l_low", "desired_l_low", "delta_l_low_raw", "delta_l", "gated_delta_l", "final_l", "carrier_ab_low", "carrier_ab_detail", "delta_ab_center", "final_ab_low", "provisional_ab", "shadow_chroma_scale", "highlight_chroma_scale", "target_hair_soft", "total_gamut_scale"):
             if key in aux["c5"]: _save_preview(debug_dir / f"{key}.png", [_normalized(aux["c5"][key], signed=("delta" in key or "detail" in key))])
+        record["stats_mask_source"] = aux["c5"].get("stats_mask_source", "unknown"); record["stats_mask_pixel_count"] = float(aux["c5"].get("stats_mask_pixel_count", aux["c5"].get("stats_mask", trusted).flatten(1).gt(.5).sum(1)).flatten()[0]); record["gate_metric_valid"] = float(aux["c5"].get("gate_metric_valid", torch.zeros(1, device=trusted.device)).flatten()[0]); record["reference_chroma_group"] = "low_chroma" if float(record.get("c0_reference_chroma_median", 0.0)) < 12 else "normal_chroma" if float(record.get("c0_reference_chroma_median", 0.0)) < 25 else "high_chroma"
         records.append(record)
-    summary = classify_components(records); metrics_dir = args.output_root / "metrics"; metrics_dir.mkdir(parents=True, exist_ok=True); (args.output_root / "per_sample.jsonl").write_text("\n".join(json.dumps(row, ensure_ascii=True) for row in records) + "\n", encoding="utf-8"); (metrics_dir / "component_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    summary = classify_components(records); metrics_dir = args.output_root / "metrics"; metrics_dir.mkdir(parents=True, exist_ok=True); (metrics_dir / "component_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     groups = {"low_chroma": [], "normal_chroma": [], "high_chroma": []}
     for row in records:
         chroma = float(row.get("c0_reference_chroma_median", 0.0)); groups["low_chroma" if chroma < 12 else "normal_chroma" if chroma < 25 else "high_chroma"].append(row)
-    for name, group in groups.items(): (metrics_dir / f"{name}.json").write_text(json.dumps(classify_components(group), indent=2), encoding="utf-8")
-    acceptance = {"version": "v2.47", "decision": summary.get("decision"), "noop_sample_fraction": summary.get("noop_sample_fraction"), "recommended_active_components": summary.get("recommended_active_components", [])}; (args.output_root / "v247_acceptance.json").write_text(json.dumps(acceptance, indent=2), encoding="utf-8"); print(json.dumps(acceptance, indent=2))
+    group_summaries = {name: classify_components(group) for name, group in groups.items()}
+    for name, group_summary in group_summaries.items(): (metrics_dir / f"{name}.json").write_text(json.dumps(group_summary, indent=2), encoding="utf-8")
+    policy = build_component_policy(summary, group_summaries); (metrics_dir / "component_policy.json").write_text(json.dumps(policy, indent=2), encoding="utf-8")
+    selected_manifest = []
+    for index, row in enumerate(rows):
+        data = load_cache(cache_dir, row["sample_id"]); trusted = probe.trusted_core(data["target_hair_mask"], data["anchor_hair_evidence"]); group = records[index]["reference_chroma_group"]; flags = selected_components_for_group(policy, group); selected, selected_aux = probe.run_selected(enable_l=flags["L"], enable_ab=flags["AB"], enable_shading=flags["Shading"], enable_plausibility=flags["Plausibility"], carrier_rgb=data["carrier_rgb"], reference_rgb=data["color_reference_rgb"], target_hair_mask=data["target_hair_mask"], reference_hair_mask=data["reference_hair_mask"], strong_anchor_rgb=data["strong_anchor_rgb"], source_hair_l=data.get("source_hair_l"), reference_l=data.get("reference_l"), carrier_stats_mask=trusted)
+        records[index]["selected_components_for_sample"] = [name for name, enabled in flags.items() if enabled]; records[index]["selected_candidate_stats_mask_source"] = selected_aux.get("stats_mask_source", "unknown"); selected_manifest.append({"sample_id": row["sample_id"], "group": group, "components": records[index]["selected_components_for_sample"]})
+        if index < 8:
+            visual_dir = args.output_root / "comparisons" / "visual"; _save_preview(visual_dir / f"sample_{index:03d}.png", [_image(data, "source_rgb", "base_rgb"), _image(data, "shape_reference_rgb", "strong_anchor_rgb", "base_rgb"), data["color_reference_rgb"], data["base_rgb"], data["strong_anchor_rgb"], selected, data["v244_alpha"], composite(data["base_rgb"], selected, data["v244_alpha"])])
+    (args.output_root / "selected_policy.json").write_text(json.dumps({"policy": policy, "samples": selected_manifest}, indent=2), encoding="utf-8"); (args.output_root / "per_sample.jsonl").write_text("\n".join(json.dumps(row, ensure_ascii=True) for row in records) + "\n", encoding="utf-8")
+    acceptance = {"version": "v2.47", "diagnostic_only": True, "overall_decision": summary.get("decision"), "carrier_contract": summary.get("carrier", {}).get("decision"), "component_policy": policy, "selected_components": summary.get("recommended_active_components", []), "disabled_groups": {key: value.get("disabled_groups", []) for key, value in policy.items()}, "noop_sample_fraction": summary.get("noop_sample_fraction")}; (args.output_root / "v247_acceptance.json").write_text(json.dumps(acceptance, indent=2), encoding="utf-8"); print(json.dumps(acceptance, indent=2))
 
 
 if __name__ == "__main__": main()

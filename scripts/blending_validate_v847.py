@@ -3,15 +3,29 @@
 from __future__ import annotations
 
 from pathlib import Path
+import importlib.util
 
 
 def main() -> None:
     root = Path(__file__).resolve().parents[1]
     residual_text = root.joinpath("models/hair_photometric_residual_v847.py").read_text(encoding="utf-8")
-    checks = {"error_estimator": root.joinpath("models/carrier_reference_error_v847.py").exists(), "reference_stats": root.joinpath("models/reference_ab_statistics_v847.py").exists(), "residual": root.joinpath("models/hair_photometric_residual_v847.py").exists(), "probe": root.joinpath("models/appearance_probe_v247.py").exists(), "metrics": root.joinpath("utils/v247_appearance_metrics.py").exists(), "scene_tint_off": "scene_tint_enabled = False" in residual_text, "plausibility_off": "v247_plausibility_enabled = False" in residual_text, "hair_only_restore": "hair_apply * (rgb_safe - carrier_rgb)" in residual_text, "no_op_path": "error[\"no_op\"]" in residual_text}
-    print("[V2.47] carrier-first error-aware residual validator; diagnostic only; no training.")
+    probe_text = root.joinpath("models/appearance_probe_v247.py").read_text(encoding="utf-8")
+    metrics_text = root.joinpath("utils/v247_appearance_metrics.py").read_text(encoding="utf-8")
+    checks = {"error_estimator": root.joinpath("models/carrier_reference_error_v847.py").exists(), "reference_stats": root.joinpath("models/reference_ab_statistics_v847.py").exists(), "residual": root.joinpath("models/hair_photometric_residual_v847.py").exists(), "probe": root.joinpath("models/appearance_probe_v247.py").exists(), "metrics": root.joinpath("utils/v247_appearance_metrics.py").exists(), "component_policy": root.joinpath("utils/v247_component_policy.py").exists(), "scene_tint_off": "scene_tint_enabled = False" in residual_text, "plausibility_off": "v247_plausibility_enabled = False" in residual_text, "plausibility_ablation": "plausibility_enabled=True" in probe_text, "hair_only_restore": "hair_apply * (rgb_safe - carrier_rgb)" in residual_text, "trusted_stats": "carrier_stats_mask" in residual_text and "stats_mask_source" in residual_text, "masked_quantile": "_masked_q" in residual_text, "strict_non_hair": "strict_non_hair_max_rgb_change" in metrics_text, "no_op_path": "error[\"no_op\"]" in residual_text}
+    print("[V2.47] carrier-first error-aware residual validator; diagnostic-only.")
+    print("NOT integrated into formal Blending_v8 inference.")
     for name, passed in checks.items(): print(f"{name}: {'PASS' if passed else 'FAIL'}")
     if not all(checks.values()): raise SystemExit(1)
+    test_path = root / "scripts/test_v247_appearance.py"
+    spec = importlib.util.spec_from_file_location("v247_correctness_tests", test_path)
+    try:
+        module = importlib.util.module_from_spec(spec); assert spec and spec.loader; spec.loader.exec_module(module); module.run_checks()
+    except ModuleNotFoundError as exc:
+        if exc.name != "torch":
+            raise
+        print("core_tests: SKIP (torch is unavailable in this environment)")
+    else:
+        print("core_tests: PASS (12 checks)")
 
 
 if __name__ == "__main__": main()

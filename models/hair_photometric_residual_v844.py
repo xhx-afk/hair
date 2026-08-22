@@ -51,6 +51,7 @@ class HairPhotometricResidualV844:
                  reference_chroma_low: torch.Tensor | None = None,
                  source_hair_l: torch.Tensor | None = None,
                  reference_l: torch.Tensor | None = None,
+                 disable_shading: bool = False,
                  return_aux: bool = False, **_: torch.Tensor):
         carrier_l, carrier_ab = carrier_lab[:, :1], carrier_lab[:, 1:]
         carrier_l_low = _blur(carrier_l, self.low_radius)
@@ -80,6 +81,9 @@ class HairPhotometricResidualV844:
             bleach_demand = (reference_l.float() - source_hair_l.float()).clamp_min(0.0)
             plausibility = 1.0 - 0.20 * (bleach_demand / 40.0).clamp(0, 1)
 
+        if disable_shading:
+            shadow_scale = torch.ones_like(shadow_scale)
+            highlight_scale = torch.ones_like(highlight_scale)
         final_c = carrier_c * shadow_scale * highlight_scale * plausibility
         final_c = (final_c + self.low_c_gain * delta_c_low).clamp_min(0.0)
         # Keep the carrier's local detail as an additive high-frequency owner.

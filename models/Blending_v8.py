@@ -82,6 +82,7 @@ from models.v840_runtime_inputs import build_v840_runtime_inputs
 from models.hair_local_recomposition_v841 import HairLocalRecompositionV841
 from models.hair_local_recomposition_v842 import HairLocalRecompositionV842
 from models.hair_local_recomposition_v843 import HairLocalRecompositionV843
+from models.hair_local_recomposition_v844 import HairLocalRecompositionV844
 from models.v841_runtime_inputs import build_v841_runtime_inputs
 from utils.bicubic import BicubicDownSample
 from utils.image_utils import DilateErosion
@@ -276,9 +277,10 @@ class Blending_v8(Blending):
         self.v228 = self.v226 and bool(getattr(self.opts, "v228_enabled", True))
         self.v229 = self.v228 and bool(getattr(self.opts, "v229_enabled", True))
         self.v230 = self.v229 and bool(getattr(self.opts, "v230_enabled", True))
-        self.v243 = self.v226 and bool(getattr(self.opts, "v243_enabled", False))
+        self.v244 = self.v226 and bool(getattr(self.opts, "v244_enabled", False))
+        self.v243 = self.v226 and bool(getattr(self.opts, "v243_enabled", False)) and not self.v244
         self.v2412 = self.v226 and bool(getattr(self.opts, "v2412_enabled", False))
-        self.v241 = self.v226 and (bool(getattr(self.opts, "v241_enabled", False)) or self.v243)
+        self.v241 = self.v226 and (bool(getattr(self.opts, "v241_enabled", False)) or self.v243 or self.v244)
         self.v240 = self.v226 and bool(getattr(self.opts, "v240_enabled", True)) and not self.v241
         self.v239 = self.v226 and bool(getattr(self.opts, "v239_enabled", True)) and not self.v240 and not self.v241
         self.v238 = self.v226 and bool(getattr(self.opts, "v238_enabled", True)) and not self.v239 and not self.v240 and not self.v241
@@ -502,7 +504,7 @@ class Blending_v8(Blending):
         self.v240_transfer = None
         self.v241_transfer = None
         if self.v241:
-            transfer_cls = HairLocalRecompositionV843 if self.v243 else HairLocalRecompositionV842 if self.v2412 else HairLocalRecompositionV841
+            transfer_cls = HairLocalRecompositionV844 if self.v244 else HairLocalRecompositionV843 if self.v243 else HairLocalRecompositionV842 if self.v2412 else HairLocalRecompositionV841
             self.v241_transfer = transfer_cls(
                 palette_mad_scale=getattr(self.opts, "v241_palette_mad_scale", 3.5),
                 palette_min_support=getattr(self.opts, "v241_palette_min_support", 16),
@@ -514,7 +516,7 @@ class Blending_v8(Blending):
                 chroma_high_gain=getattr(self.opts, "v241_chroma_high_gain", 0.20),
                 contact_radius=getattr(self.opts, "v241_contact_radius", 5),
                 matte_ring_radius=getattr(self.opts, "v241_matte_ring_radius", 5),
-                version="v2.43" if self.v243 else "v2.41.2" if self.v2412 else "v2.41.1",
+                version="v2.44" if self.v244 else "v2.43" if self.v243 else "v2.41.2" if self.v2412 else "v2.41.1",
             )
             transfer_config = self.v241_transfer.config_dict()
             print(

@@ -35,7 +35,7 @@ class StrandAwareHairMatteV843:
         skin = torch.zeros_like(coarse) if source_skin_mask is None else source_skin_mask.float().clamp(0, 1)
         conflict = torch.zeros_like(coarse) if skin_conflict is None else skin_conflict.float().clamp(0, 1)
         connectivity = F.avg_pool2d(coarse, 5, stride=1, padding=2) if local_connectivity is None else local_connectivity.float().clamp(0, 1)
-        target_transition = (coarse - safe).clamp(0, 1) if transition_prior is None else transition_prior.float().clamp(0, 1)
+        target_transition = (coarse - safe - uncertain).clamp(0, 1) if transition_prior is None else transition_prior.float().clamp(0, 1)
         quality = (0.45 * evidence + 0.35 * strand + 0.20 * connectivity).clamp(0, 1)
         uncertain_alpha = (quality * uncertain * (1.0 - 0.60 * conflict)).clamp(0, 1)
         transition_alpha = (target_transition * quality).clamp(0, 1)

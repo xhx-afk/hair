@@ -15,7 +15,9 @@ def _blur(value: torch.Tensor, radius: int) -> torch.Tensor:
 
 def new_hair_illumination_v843(*, base_rgb: torch.Tensor, strong_anchor_rgb: torch.Tensor,
                                target_hair_mask: torch.Tensor, source_hair_mask: torch.Tensor | None,
-                               reference_l_center: torch.Tensor, radius: int = 11) -> dict[str, torch.Tensor]:
+                               reference_l_center: torch.Tensor, radius: int = 11,
+                               max_low_l_delta: float = 12.0,
+                               carrier_l: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
     target = target_hair_mask.float().clamp(0, 1)
     source = torch.zeros_like(target) if source_hair_mask is None else source_hair_mask.float().clamp(0, 1)
     existing = target * source
@@ -29,7 +31,11 @@ def new_hair_illumination_v843(*, base_rgb: torch.Tensor, strong_anchor_rgb: tor
     anchor_center = torch.stack(values).view(-1, 1, 1, 1)
     anchor_residual = anchor_l - anchor_center
     new_l = reference_l_center.float() + 0.8 * anchor_residual
-    mapped = existing * base_l + new * new_l + (1.0 - target) * base_l
+    desired = existing * base_l + new * new_l + (1.0 - target) * base_l
+    carrier_l = anchor_l if carrier_l is None else carrier_l.float()
+    carrier_l_low = _blur(carrier_l, radius)
+    delta_l_low = (desired - carrier_l_low).clamp(-float(max_low_l_delta), float(max_low_l_delta))
+    mapped = carrier_l + delta_l_low
     return {
         "existing_hair": existing,
         "new_hair": new,
@@ -38,6 +44,10 @@ def new_hair_illumination_v843(*, base_rgb: torch.Tensor, strong_anchor_rgb: tor
         "anchor_l_residual": anchor_residual,
         "existing_hair_l_low": existing * base_l,
         "new_hair_l_low": new * new_l,
+        "desired_l_low": desired,
+        "carrier_l": carrier_l,
+        "carrier_l_low": carrier_l_low,
+        "delta_l_low": delta_l_low,
         "mapped_l_low": mapped,
     }
 

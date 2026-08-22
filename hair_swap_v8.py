@@ -269,6 +269,8 @@ def get_parser_v8():
     parser.set_defaults(v241_enabled=True)
     parser.add_argument("--v243-enabled", dest="v243_enabled", action="store_true")
     parser.set_defaults(v243_enabled=False)
+    parser.add_argument("--v244-enabled", dest="v244_enabled", action="store_true")
+    parser.set_defaults(v244_enabled=False)
     parser.add_argument("--v241-palette-mad-scale", type=float, default=3.5)
     parser.add_argument("--v241-palette-min-support", type=int, default=16)
     parser.add_argument("--v241-illumination-radius", type=int, default=11)

@@ -88,7 +88,7 @@ class HairCoreConfidenceV843:
         dense = (dense * (1.0 - 0.40 * skin_conflict)).clamp(0, 1)
         safe = (dense >= self.safe_threshold).float()
         uncertain = ((dense >= self.uncertain_threshold) & (dense < self.safe_threshold)).float()
-        transition = (target - safe).clamp(0, 1)
+        transition = (target - safe - uncertain).clamp(0, 1)
         out = {
             "distance_prior": distance,
             "strand_structure_confidence": strand,

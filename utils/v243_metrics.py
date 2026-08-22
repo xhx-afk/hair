@@ -77,7 +77,7 @@ def v243_metric_tensors(*, target_hair_mask: torch.Tensor, hair_alpha_final: tor
             out["shadow_chroma_ratio"] = _median(c, shadow) / _median(c, mid).clamp_min(1e-4)
             out["highlight_chroma_ratio"] = _median(c, target * (l >= q80).float()) / _median(c, mid).clamp_min(1e-4)
     if scene_illumination_ab is not None:
-        out["scene_illumination_shift_deg"] = torch.atan2(scene_illumination_ab[:, 1:2], scene_illumination_ab[:, 0:1]).flatten(1).mean(1).abs()
+        out["scene_illumination_shift_deg"] = (torch.atan2(scene_illumination_ab[:, 1:2], scene_illumination_ab[:, 0:1]) * (180.0 / torch.pi)).flatten(1).mean(1).abs()
     if source_hair_l is not None and reference_l is not None:
         demand = (reference_l.float() - source_hair_l.float()).clamp_min(0)
         out["bleach_demand"] = demand.flatten(1).mean(1)

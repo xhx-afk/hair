@@ -33,6 +33,24 @@ class AppearanceProbeV247:
         candidates["c0"] = carrier_rgb
         c1 = aux["c1"]
         aux["c0"] = build_carrier_noop_aux(carrier_rgb=carrier_rgb, carrier_l=c1["carrier_l"], carrier_l_low=c1["carrier_l_low"], carrier_ab=c1["carrier_ab"], carrier_ab_low=c1["carrier_ab_low"], carrier_ab_detail=c1["carrier_ab_detail"], target_hair_soft=c1["target_hair_soft"], stats_mask=c1["stats_mask"], stats_mask_source=c1["stats_mask_source"], gate_metric_valid=c1["gate_metric_valid"])
+        # Preserve the complete AUX schema while keeping every C0 tensor
+        # independently allocated from C1 storage.
+        zero_tokens = ("gate", "delta", "correction", "clamp", "p90", "mean_abs", "magnitude", "desired")
+        one_tokens = ("scale",)
+        for key, value in c1.items():
+            if key in aux["c0"]:
+                continue
+            if torch.is_tensor(value):
+                if any(token in key for token in zero_tokens):
+                    aux["c0"][key] = torch.zeros_like(value)
+                elif any(token in key for token in one_tokens):
+                    aux["c0"][key] = torch.ones_like(value)
+                else:
+                    aux["c0"][key] = value.clone()
+            else:
+                aux["c0"][key] = value
+        if set(aux["c0"]) != set(c1):
+            raise RuntimeError("C0/C1 AUX schema mismatch")
         outputs = {f"{name}_rgb": value for name, value in candidates.items()}
         if trusted_alpha is not None:
             outputs.update({name.replace("_rgb", "_preview"): composite(carrier_rgb, value, trusted_alpha) for name, value in outputs.items()})

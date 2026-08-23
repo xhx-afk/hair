@@ -39,6 +39,7 @@ def run_checks() -> None:
     probe = AppearanceProbeV247()
     source_l = torch.full_like(target, .05); reference_l = torch.full_like(target, .95)
     outputs, aux = probe(carrier_rgb=base, reference_rgb=reference, target_hair_mask=target, reference_hair_mask=target, strong_anchor_rgb=base, source_hair_l=source_l, reference_l=reference_l, trusted_alpha=trusted, return_aux=True)
+    assert set(aux["c0"].keys()) == set(aux["c1"].keys())
     assert torch.allclose(aux["c4"]["plausibility_scale"], torch.ones_like(aux["c4"]["plausibility_scale"]))
     assert float(aux["c5"]["plausibility_scale"].min()) < 1.0
     assert not torch.allclose(outputs["c4_rgb"], outputs["c5_rgb"])
@@ -145,15 +146,20 @@ def run_checks() -> None:
     no_plaus_row["reference_chroma_group"] = "high_chroma"
     from utils.v247_appearance_metrics import classify_components
     assert classify_components([no_plaus_row])["plausibility_module"]["decision"] == "PLAUSIBILITY_MODULE_NOT_HELPFUL"
+    gain_row = dict(no_plaus_row)
+    gain_row.update({"c4_chroma_error": 1.0, "c5_chroma_error": .90, "c4_median_ab_error": 1.0, "c5_median_ab_error": .90, "c4_stable_hue_error_deg": 1.0, "c5_stable_hue_error_deg": .5})
+    assert classify_components([gain_row])["plausibility_module"]["decision"] == "PLAUSIBILITY_MODULE_USEFUL"
 
     # Acceptance must expose exactly the globally enabled policy components.
     selected_global = [component for component, entry in policy.items() if entry["global_enabled"]]
     assert selected_global == [component for component, enabled in selected_components_for_group(policy, "normal_chroma").items() if enabled]
+    selected_summary_keys = {"selected_components", "selected_l_q50_error", "selected_median_ab_error", "selected_chroma_error", "selected_hue_error", "carrier_mid_structure_corr", "carrier_gradient_structure_corr", "carrier_relative_mid_energy", "carrier_relative_hf_energy", "strict_non_hair_max_rgb_change"}
+    assert len(selected_summary_keys) == 10
 
 
 def main() -> None:
     run_checks()
-    print("V2.47 appearance correctness tests: PASS (18 checks)")
+    print("V2.47 appearance correctness tests: PASS (20 checks)")
 
 
 if __name__ == "__main__":

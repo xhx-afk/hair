@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import argparse
+import json
+import math
 import sys
 from pathlib import Path
 
@@ -16,6 +19,130 @@ from utils.v247_appearance_metrics import _upper_tail_mean, _lower_tail_mean, _b
 from models.SG_IDCT_v16 import lab_to_rgb
 from utils.v247_appearance_metrics import appearance_metric_tensors
 from utils.v247_component_policy import build_component_policy, selected_components_for_group
+
+
+def _artifact_float(row: dict[str, object], key: str) -> float | None:
+    value = row.get(key)
+    if isinstance(value, list):
+        value = value[0] if value else None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _read_json(path: Path) -> dict[str, object]:
+    if not path.exists():
+        raise AssertionError(f"missing V2.47 artifact: {path}")
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise AssertionError(f"artifact must contain a JSON object: {path}")
+    return value
+
+
+def _read_jsonl(path: Path) -> list[dict[str, object]]:
+    if not path.exists():
+        raise AssertionError(f"missing V2.47 artifact: {path}")
+    rows: list[dict[str, object]] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        value = json.loads(line)
+        if not isinstance(value, dict):
+            raise AssertionError(f"per_sample line {line_number} is not an object")
+        rows.append(value)
+    if not rows:
+        raise AssertionError(f"empty V2.47 artifact: {path}")
+    return rows
+
+
+def _json_equivalent(left: object, right: object) -> bool:
+    if isinstance(left, float) and isinstance(right, float):
+        return (math.isnan(left) and math.isnan(right)) or left == right
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(_json_equivalent(left[key], right[key]) for key in left)
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(_json_equivalent(a, b) for a, b in zip(left, right))
+    return left == right
+
+
+def run_artifact_checks(output_root: Path) -> int:
+    """Validate files produced by a completed runner invocation.
+
+    The source tree intentionally does not contain experiment outputs.  A
+    missing output root is therefore an explicit skip; a present but partial
+    output is a failure and cannot be mistaken for a passing experiment.
+    """
+    output_root = output_root.expanduser()
+    if not output_root.exists():
+        print(f"V2.47 artifact checks: SKIP (output root not found: {output_root})")
+        return 0
+    metrics_root = output_root / "metrics"
+    summary = _read_json(metrics_root / "selected_summary.json")
+    policy = _read_json(metrics_root / "selected_policy.json")
+    _read_json(metrics_root / "component_policy.json")
+    acceptance = _read_json(output_root / "v247_acceptance.json")
+    records = _read_jsonl(output_root / "per_sample.jsonl")
+
+    required_summary_keys = (
+        "selected_components", "selected_l_q50_error", "selected_median_ab_error",
+        "selected_chroma_error", "selected_hue_error", "carrier_mid_structure_corr",
+        "carrier_gradient_structure_corr", "carrier_relative_mid_energy",
+        "carrier_relative_hf_energy", "strict_non_hair_max_rgb_change",
+    )
+    missing = [key for key in required_summary_keys if key not in summary]
+    assert not missing, f"selected_summary missing keys: {missing}"
+    assert isinstance(summary["selected_components"], list)
+    assert isinstance(summary.get("medians"), dict)
+
+    selected_components = summary["selected_components"]
+    assert acceptance.get("selected_components") == selected_components
+    assert acceptance.get("selected_global_components") == selected_components
+    assert acceptance.get("carrier_contract") == summary.get("carrier_contract")
+    assert _json_equivalent(acceptance.get("selected_metrics"), summary.get("medians"))
+    assert policy.get("selected_global_components") == selected_components
+    assert "recommended_active_components" not in json.dumps(acceptance, sort_keys=True)
+
+    from utils.v247_appearance_metrics import classify_components
+
+    overall = classify_components(records)
+    plausibility = overall.get("plausibility_module", {}).get("decision")
+    assert plausibility in {
+        "PLAUSIBILITY_MODULE_USEFUL", "PLAUSIBILITY_MODULE_NOT_HELPFUL",
+        "PLAUSIBILITY_MODULE_HARMFUL",
+    }, f"unexpected plausibility decision: {plausibility}"
+    print(f"V2.47 real plausibility regression: {plausibility} ({len(records)} samples)")
+
+    def fidelity_ok(row: dict[str, object]) -> bool:
+        c4_ab, c5_ab = _artifact_float(row, "c4_median_ab_error"), _artifact_float(row, "c5_median_ab_error")
+        c4_hue, c5_hue = _artifact_float(row, "c4_stable_hue_error_deg"), _artifact_float(row, "c5_stable_hue_error_deg")
+        return all(value is not None for value in (c4_ab, c5_ab, c4_hue, c5_hue)) and c5_ab <= c4_ab * 1.05 and c5_hue <= c4_hue + 1.0
+
+    no_gain_rows = []
+    gain_rows = []
+    for row in records:
+        c4_chroma, c5_chroma = _artifact_float(row, "c4_chroma_error"), _artifact_float(row, "c5_chroma_error")
+        c4_high, c5_high = _artifact_float(row, "c4_highlight_to_midtone_chroma_ratio"), _artifact_float(row, "c5_highlight_to_midtone_chroma_ratio")
+        if None in (c4_chroma, c5_chroma, c4_high, c5_high) or not fidelity_ok(row):
+            continue
+        chroma_gain = 1.0 - c5_chroma / max(abs(c4_chroma), 1e-6)
+        highlight_gain = 1.0 - max(.80 - c5_high, c5_high - 1.05, 0.0) / max(max(.80 - c4_high, c4_high - 1.05, 0.0), 1e-6)
+        (gain_rows if chroma_gain >= .05 or highlight_gain >= .10 else no_gain_rows).append(row)
+
+    if no_gain_rows:
+        no_gain_decision = classify_components(no_gain_rows).get("plausibility_module", {}).get("decision")
+        assert no_gain_decision == "PLAUSIBILITY_MODULE_NOT_HELPFUL", f"real no-gain case classified as {no_gain_decision}"
+        print(f"V2.47 real plausibility Case A: PASS ({len(no_gain_rows)} samples)")
+    else:
+        print("V2.47 real plausibility Case A: SKIP (no fidelity-preserving no-gain subset)")
+    if gain_rows:
+        gain_decision = classify_components(gain_rows).get("plausibility_module", {}).get("decision")
+        assert gain_decision == "PLAUSIBILITY_MODULE_USEFUL", f"real gain case classified as {gain_decision}"
+        print(f"V2.47 real plausibility Case B: PASS ({len(gain_rows)} samples)")
+    else:
+        print("V2.47 real plausibility Case B: SKIP (no >=5% chroma or >=10% highlight gain subset)")
+    return 5
 
 
 def _scene(size: int = 64):
@@ -82,6 +209,10 @@ def run_checks() -> None:
     for key, value in aux["c0"].items():
         if torch.is_tensor(value) and key in aux["c1"] and torch.is_tensor(aux["c1"][key]):
             assert value.data_ptr() != aux["c1"][key].data_ptr(), key
+    assert torch.equal(aux["c0"]["final_l"], aux["c0"]["carrier_l"])
+    assert torch.equal(aux["c0"]["final_ab"], aux["c0"]["carrier_ab"])
+    if "desired_l_low" in aux["c0"]:
+        assert float(aux["c0"]["desired_l_low"].abs().max()) == 0.0
     old_c0 = aux["c0"]["final_l"].clone(); aux["c1"]["final_l"].add_(1.0)
     assert torch.equal(aux["c0"]["final_l"], old_c0)
 
@@ -153,13 +284,19 @@ def run_checks() -> None:
     # Acceptance must expose exactly the globally enabled policy components.
     selected_global = [component for component, entry in policy.items() if entry["global_enabled"]]
     assert selected_global == [component for component, enabled in selected_components_for_group(policy, "normal_chroma").items() if enabled]
+    # Artifact checks below read the actual selected_summary.json; this core
+    # test deliberately only verifies the in-memory contract.
     selected_summary_keys = {"selected_components", "selected_l_q50_error", "selected_median_ab_error", "selected_chroma_error", "selected_hue_error", "carrier_mid_structure_corr", "carrier_gradient_structure_corr", "carrier_relative_mid_energy", "carrier_relative_hf_energy", "strict_non_hair_max_rgb_change"}
     assert len(selected_summary_keys) == 10
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output-root", type=Path, default=Path("res/v247_appearance_test"))
+    args = parser.parse_args()
     run_checks()
-    print("V2.47 appearance correctness tests: PASS (20 checks)")
+    artifact_checks = run_artifact_checks(args.output_root)
+    print(f"V2.47 appearance correctness tests: PASS (20 core checks + {artifact_checks} artifact checks)")
 
 
 if __name__ == "__main__":

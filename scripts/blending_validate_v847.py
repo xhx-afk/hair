@@ -18,14 +18,8 @@ def main() -> None:
     if not all(checks.values()): raise SystemExit(1)
     test_path = root / "scripts/test_v247_appearance.py"
     spec = importlib.util.spec_from_file_location("v247_correctness_tests", test_path)
-    try:
-        module = importlib.util.module_from_spec(spec); assert spec and spec.loader; spec.loader.exec_module(module); module.run_checks()
-    except ModuleNotFoundError as exc:
-        if exc.name != "torch":
-            raise
-        print("core_tests: SKIP (torch is unavailable in this environment)")
-    else:
-        print("core_tests: PASS (18 checks)")
+    module = importlib.util.module_from_spec(spec); assert spec and spec.loader; spec.loader.exec_module(module); module.run_checks()
+    print("core_tests: PASS (18 checks)")
 
 
 if __name__ == "__main__": main()

@@ -19,7 +19,9 @@ from utils.v247_component_policy import build_component_policy, selected_compone
 
 
 def _scene(size: int = 64):
-    base = torch.full((1, 3, size, size), .35)
+    axis = torch.linspace(-1.0, 1.0, size)
+    pattern = (axis.view(1, 1, size, 1) * .025 + axis.view(1, 1, 1, size) * .025)
+    base = (torch.full((1, 3, size, size), .35) + pattern).clamp(0, 1)
     reference = torch.full_like(base, .62)
     target = torch.zeros((1, 1, size, size)); target[:, :, 8:56, 8:56] = 1
     return base, reference, target, target.clone()
@@ -76,6 +78,9 @@ def run_checks() -> None:
     for key in ("l_gate_strength", "ab_gate_strength", "shadow_gate_strength", "highlight_gate_strength", "shading_gate_strength", "plausibility_gate_strength", "delta_l", "gated_delta_l", "delta_ab_center"):
         assert float(aux["c0"][key].abs().max()) == 0.0
     assert float(aux["c0"]["total_gamut_scale"].min()) == 1.0 and float(aux["c0"]["no_op"].min()) == 1.0
+    for key, value in aux["c0"].items():
+        if torch.is_tensor(value) and key in aux["c1"] and torch.is_tensor(aux["c1"][key]):
+            assert value.data_ptr() != aux["c1"][key].data_ptr(), key
     old_c0 = aux["c0"]["final_l"].clone(); aux["c1"]["final_l"].add_(1.0)
     assert torch.equal(aux["c0"]["final_l"], old_c0)
 
@@ -110,10 +115,15 @@ def run_checks() -> None:
 
     # 15. Selected candidate flags are exactly the group policy flags.
     flags = selected_components_for_group(policy, "high_chroma")
-    _, selected_aux = probe.run_selected(enable_l=flags["L"], enable_ab=flags["AB"], enable_shading=flags["Shading"], enable_plausibility=flags["Plausibility"], carrier_rgb=base, reference_rgb=reference, target_hair_mask=target, reference_hair_mask=target, strong_anchor_rgb=base, source_hair_l=source_l, reference_l=reference_l, carrier_stats_mask=trusted)
+    selected_rgb, selected_aux = probe.run_selected(enable_l=flags["L"], enable_ab=flags["AB"], enable_shading=flags["Shading"], enable_plausibility=flags["Plausibility"], carrier_rgb=base, reference_rgb=reference, target_hair_mask=target, reference_hair_mask=target, strong_anchor_rgb=base, source_hair_l=source_l, reference_l=reference_l, carrier_stats_mask=trusted)
     assert float(selected_aux["ab_gate_strength"].max()) == 0.0
-    selected_metrics = appearance_metric_tensors(carrier_rgb=base, output_rgb=selected, trusted_core=trusted, reference_rgb=reference, reference_hair_mask=target, aux=selected_aux)
+    selected_metrics = appearance_metric_tensors(carrier_rgb=base, output_rgb=selected_rgb, trusted_core=trusted, reference_rgb=reference, reference_hair_mask=target, aux=selected_aux)
     assert "l_q50_error" in selected_metrics and "strict_non_hair_max_rgb_change" in selected_metrics
+    assert float(selected_metrics["carrier_mid_structure_corr"].min()) >= .95
+    assert float(selected_metrics["carrier_gradient_structure_corr"].min()) >= .95
+    assert .95 <= float(selected_metrics["carrier_relative_mid_energy"].median()) <= 1.10
+    assert .90 <= float(selected_metrics["carrier_relative_hf_energy"].median()) <= 1.15
+    assert float(selected_metrics["strict_non_hair_max_rgb_change"].max()) <= 1e-5
 
     # 16. Invalid shading regions are explicitly marked, never treated as zero.
     tiny = torch.zeros_like(target); tiny[:, :, 20:25, 20:25] = 1
@@ -125,7 +135,20 @@ def run_checks() -> None:
     assert distance(.30, .70, .95) > distance(.60, .70, .95)
 
     # 18. Plausibility requires positive gain, not merely no degradation.
-    assert not (abs(.01) >= .05 or abs(.01) >= .10)
+    common = {"appearance_metric_valid": 1, "median_ab_error": 1., "chroma_error": 1., "stable_hue_error_deg": 1., "shadow_to_midtone_chroma_ratio": .8, "highlight_to_midtone_chroma_ratio": .9, "carrier_mid_structure_corr": .99, "carrier_gradient_structure_corr": .99, "carrier_relative_mid_energy": 1., "carrier_relative_hf_energy": 1., "strict_non_hair_max_rgb_change": 0., "l_q10_error": 1., "l_q25_error": 1., "l_q50_error": 1., "l_q75_error": 1., "l_q90_error": 1., "l_delta_clamp_fraction": 0., "plausibility_gate_strength": .5, "noop": 0}
+    no_plaus_gain = []
+    for variant in ("c0", "c1", "c2", "c3", "c4", "c5"):
+        no_plaus_gain.append({f"{variant}_{key}": value for key, value in common.items()})
+    no_plaus_row = {}
+    for part in no_plaus_gain:
+        no_plaus_row.update(part)
+    no_plaus_row["reference_chroma_group"] = "high_chroma"
+    from utils.v247_appearance_metrics import classify_components
+    assert classify_components([no_plaus_row])["plausibility_module"]["decision"] == "PLAUSIBILITY_MODULE_NOT_HELPFUL"
+
+    # Acceptance must expose exactly the globally enabled policy components.
+    selected_global = [component for component, entry in policy.items() if entry["global_enabled"]]
+    assert selected_global == [component for component, enabled in selected_components_for_group(policy, "normal_chroma").items() if enabled]
 
 
 def main() -> None:

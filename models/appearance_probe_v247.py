@@ -6,6 +6,7 @@ import torch
 
 from models.hair_photometric_residual_v847 import HairPhotometricResidualV847
 from models.v245_death_test_common import composite, erode, smoothstep
+from models.v247_noop_aux import build_carrier_noop_aux
 
 
 class AppearanceProbeV247:
@@ -30,23 +31,8 @@ class AppearanceProbeV247:
         # C0 is a real carrier baseline.  Keep only geometry/statistics needed
         # for diagnostics; every correction-related field must describe a no-op.
         candidates["c0"] = carrier_rgb
-        aux["c0"] = dict(aux["c1"])
-        carrier_lab = aux["c1"].get("carrier_l")
-        carrier_ab = aux["c1"].get("carrier_ab")
-        if carrier_lab is not None:
-            aux["c0"]["final_l"] = carrier_lab.clone()
-        if carrier_ab is not None:
-            aux["c0"]["final_ab"] = carrier_ab.clone()
-            aux["c0"]["final_ab_low"] = aux["c1"].get("carrier_ab_low", carrier_ab).clone()
-            aux["c0"]["provisional_ab"] = carrier_ab.clone()
-        for key in ("l_gate_strength", "ab_gate_strength", "shadow_gate_strength", "highlight_gate_strength", "shading_gate_strength", "plausibility_gate_strength", "l_delta", "gated_delta_l", "delta_ab_center", "l_delta_clamp_fraction", "l_delta_p90", "l_delta_mean_abs", "ab_correction_magnitude"):
-            if key in aux["c0"] and torch.is_tensor(aux["c0"][key]):
-                aux["c0"][key] = torch.zeros_like(aux["c0"][key])
-        for key in ("shadow_chroma_scale", "highlight_chroma_scale", "plausibility_scale", "total_gamut_scale", "pre_gamut_scale", "final_gamut_scale"):
-            if key in aux["c0"] and torch.is_tensor(aux["c0"][key]):
-                aux["c0"][key] = torch.ones_like(aux["c0"][key])
-        aux["c0"]["candidate_rgb"] = carrier_rgb.clone()
-        aux["c0"]["no_op"] = torch.ones_like(aux["c1"].get("no_op", torch.ones(carrier_rgb.size(0), device=carrier_rgb.device)))
+        c1 = aux["c1"]
+        aux["c0"] = build_carrier_noop_aux(carrier_rgb=carrier_rgb, carrier_l=c1["carrier_l"], carrier_l_low=c1["carrier_l_low"], carrier_ab=c1["carrier_ab"], carrier_ab_low=c1["carrier_ab_low"], carrier_ab_detail=c1["carrier_ab_detail"], target_hair_soft=c1["target_hair_soft"], stats_mask=c1["stats_mask"], stats_mask_source=c1["stats_mask_source"], gate_metric_valid=c1["gate_metric_valid"])
         outputs = {f"{name}_rgb": value for name, value in candidates.items()}
         if trusted_alpha is not None:
             outputs.update({name.replace("_rgb", "_preview"): composite(carrier_rgb, value, trusted_alpha) for name, value in outputs.items()})

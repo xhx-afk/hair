@@ -102,13 +102,35 @@ def main() -> None:
     for name, group_summary in group_summaries.items(): (metrics_dir / f"{name}.json").write_text(json.dumps(group_summary, indent=2), encoding="utf-8")
     policy = build_component_policy(summary, group_summaries); (metrics_dir / "component_policy.json").write_text(json.dumps(policy, indent=2), encoding="utf-8")
     selected_manifest = []
+    selected_metric_keys = ("l_q10_error", "l_q25_error", "l_q50_error", "l_q75_error", "l_q90_error", "median_ab_error", "chroma_error", "stable_hue_error_deg", "carrier_mid_structure_corr", "carrier_gradient_structure_corr", "carrier_relative_mid_energy", "carrier_relative_hf_energy", "shadow_to_midtone_chroma_ratio", "highlight_to_midtone_chroma_ratio", "strict_non_hair_max_rgb_change", "trusted_core_gamut_heavy_fraction", "target_hair_gamut_heavy_fraction", "noop")
     for index, row in enumerate(rows):
         data = load_cache(cache_dir, row["sample_id"]); trusted = probe.trusted_core(data["target_hair_mask"], data["anchor_hair_evidence"]); group = records[index]["reference_chroma_group"]; flags = selected_components_for_group(policy, group); selected, selected_aux = probe.run_selected(enable_l=flags["L"], enable_ab=flags["AB"], enable_shading=flags["Shading"], enable_plausibility=flags["Plausibility"], carrier_rgb=data["carrier_rgb"], reference_rgb=data["color_reference_rgb"], target_hair_mask=data["target_hair_mask"], reference_hair_mask=data["reference_hair_mask"], strong_anchor_rgb=data["strong_anchor_rgb"], source_hair_l=data.get("source_hair_l"), reference_l=data.get("reference_l"), carrier_stats_mask=trusted)
-        records[index]["selected_components_for_sample"] = [name for name, enabled in flags.items() if enabled]; records[index]["selected_candidate_stats_mask_source"] = selected_aux.get("stats_mask_source", "unknown"); selected_manifest.append({"sample_id": row["sample_id"], "group": group, "components": records[index]["selected_components_for_sample"]})
+        selected_metrics = appearance_metric_tensors(carrier_rgb=data["carrier_rgb"], output_rgb=selected, trusted_core=trusted, reference_rgb=data["color_reference_rgb"], reference_hair_mask=data["reference_hair_mask"], aux=selected_aux)
+        records[index]["selected_components_for_sample"] = [name for name, enabled in flags.items() if enabled]; records[index]["selected_candidate_stats_mask_source"] = selected_aux.get("stats_mask_source", "unknown"); records[index]["selected_metric_valid"] = _value(selected_metrics.get("appearance_metric_valid", torch.zeros(1, device=trusted.device)))
+        for key in selected_metric_keys:
+            if key in selected_metrics: records[index][f"selected_{key}"] = _value(selected_metrics[key])
+        selected_manifest.append({"sample_id": row["sample_id"], "group": group, "components": records[index]["selected_components_for_sample"]})
         if index < 8:
             visual_dir = args.output_root / "comparisons" / "visual"; _save_preview(visual_dir / f"sample_{index:03d}.png", [_image(data, "source_rgb", "base_rgb"), _image(data, "shape_reference_rgb", "strong_anchor_rgb", "base_rgb"), data["color_reference_rgb"], data["base_rgb"], data["strong_anchor_rgb"], selected, data["v244_alpha"], composite(data["base_rgb"], selected, data["v244_alpha"])])
-    (args.output_root / "selected_policy.json").write_text(json.dumps({"policy": policy, "samples": selected_manifest}, indent=2), encoding="utf-8"); (args.output_root / "per_sample.jsonl").write_text("\n".join(json.dumps(row, ensure_ascii=True) for row in records) + "\n", encoding="utf-8")
-    acceptance = {"version": "v2.47", "diagnostic_only": True, "overall_decision": summary.get("decision"), "carrier_contract": summary.get("carrier", {}).get("decision"), "component_policy": policy, "selected_components": summary.get("recommended_active_components", []), "disabled_groups": {key: value.get("disabled_groups", []) for key, value in policy.items()}, "noop_sample_fraction": summary.get("noop_sample_fraction")}; (args.output_root / "v247_acceptance.json").write_text(json.dumps(acceptance, indent=2), encoding="utf-8"); print(json.dumps(acceptance, indent=2))
+    selected_valid = [row for row in records if float(row.get("selected_metric_valid", 0.0)) > .5]
+    def selected_median(key):
+        values = [float(row[f"selected_{key}"]) for row in selected_valid if isinstance(row.get(f"selected_{key}"), (int, float))]
+        return float(torch.tensor(values).median()) if values else float("nan")
+    selected_contract = selected_valid and selected_median("carrier_mid_structure_corr") >= .95 and selected_median("carrier_gradient_structure_corr") >= .95 and .95 <= selected_median("carrier_relative_mid_energy") <= 1.10 and .90 <= selected_median("carrier_relative_hf_energy") <= 1.15 and selected_median("strict_non_hair_max_rgb_change") <= 1e-5
+    selected_summary = {"count": len(selected_valid), "valid_fraction": len(selected_valid) / max(len(records), 1), "medians": {key: selected_median(key) for key in selected_metric_keys}, "carrier_contract": "PASS" if selected_contract else "FAIL"}
+    (metrics_dir / "selected_summary.json").write_text(json.dumps(selected_summary, indent=2, allow_nan=True), encoding="utf-8")
+    selected_global_components = [component for component, entry in policy.items() if entry["global_enabled"]]
+    if not selected_contract: final_decision = "V247_SELECTED_CARRIER_CONTRACT_FAIL"
+    elif not selected_global_components: final_decision = "V247_CARRIER_ONLY"
+    elif selected_global_components == ["AB"]: final_decision = "V247_ERROR_AWARE_AB_ONLY"
+    elif selected_global_components == ["L"]: final_decision = "V247_ERROR_AWARE_L_ONLY"
+    elif set(("L", "AB", "Shading")).issubset(selected_global_components): final_decision = "V247_ERROR_AWARE_L_AB_SHADING"
+    else: final_decision = "V247_ERROR_AWARE_L_AB"
+    (args.output_root / "selected_policy.json").write_text(json.dumps({"policy": policy, "samples": selected_manifest}, indent=2), encoding="utf-8"); (args.output_root / "per_sample.jsonl").write_text("\n".join(json.dumps(row, ensure_ascii=True, allow_nan=True) for row in records) + "\n", encoding="utf-8")
+    c0_selected_l = float(torch.tensor([float(row.get("c0_l_q50_error", float("inf"))) for row in selected_valid]).median()) if selected_valid else float("nan")
+    reference_gain = bool(selected_valid) and selected_median("l_q50_error") <= c0_selected_l * .95
+    acceptance = {"version": "v2.47", "diagnostic_only": True, "component_attribution": {"L": summary.get("l_module", {}).get("decision"), "AB": summary.get("ab_module", {}).get("decision"), "Shading": summary.get("shading_module", {}).get("decision"), "Plausibility": summary.get("plausibility_module", {}).get("decision")}, "component_policy": policy, "selected_global_components": selected_global_components, "selected_candidate": {"carrier_contract": selected_summary["carrier_contract"], "reference_fidelity": "PASS" if reference_gain else ("NO_GAIN" if selected_valid else "FAIL"), "hair_only_contract": "PASS" if selected_median("strict_non_hair_max_rgb_change") <= 1e-5 else "FAIL", "gamut": "PASS" if selected_valid else "FAIL"}, "overall_decision": final_decision, "selected_summary": selected_summary}
+    (args.output_root / "v247_acceptance.json").write_text(json.dumps(acceptance, indent=2, allow_nan=True), encoding="utf-8"); print(json.dumps(acceptance, indent=2, allow_nan=True))
 
 
 if __name__ == "__main__": main()

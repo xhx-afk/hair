@@ -27,6 +27,27 @@ def _clamp_vector(value: torch.Tensor, maximum: float) -> torch.Tensor:
     return value * (float(maximum) / magnitude.clamp_min(1e-4)).clamp(max=1.0)
 
 
+def _spatialize(value: torch.Tensor, reference: torch.Tensor, *, name: str) -> torch.Tensor:
+    """Enforce the residual Lab map contract before channel concatenation."""
+    batch, channels, height, width = reference.size(0), reference.size(1), reference.size(-2), reference.size(-1)
+    if value.dim() == 4 and value.size(0) == batch and value.size(1) == channels and value.shape[-2:] == (height, width):
+        return value
+    if value.numel() != batch * channels * height * width:
+        raise RuntimeError(f"{name} cannot be reshaped to [B,C,H,W]: {tuple(value.shape)} vs {tuple(reference.shape)}")
+    return value.reshape(batch, channels, height, width)
+
+
+def _batch_scalar(value: torch.Tensor, batch: int, *, name: str) -> torch.Tensor:
+    """Normalize an estimator gate to one value per sample."""
+    flat = value.reshape(batch, -1)
+    if flat.size(1) == 1:
+        return flat[:, 0]
+    first = flat[:, :1]
+    if not torch.allclose(flat, first.expand_as(flat), atol=1e-6, rtol=1e-6):
+        raise RuntimeError(f"{name} must be a per-sample scalar, got {tuple(value.shape)}")
+    return first[:, 0]
+
+
 def _region_ratio(chroma: torch.Tensor, luma: torch.Tensor, mask: torch.Tensor, low: float, high: float | None = None) -> torch.Tensor:
     q_low = _masked_q(luma, mask, low).view(-1, 1, 1, 1)
     indicator = luma <= q_low if high is None else ((luma >= q_low) & (luma <= _masked_q(luma, mask, high).view(-1, 1, 1, 1)))
@@ -72,6 +93,17 @@ class HairPhotometricResidualV847:
         stats_mask_source = "trusted_core" if supplied_stats and bool(torch.all(trusted_count >= 256)) else "eroded_target"
         stats_mask = carrier_stats_mask.float().clamp(0, 1) if stats_mask_source == "trusted_core" else erode(target_hair_mask.float().clamp(0, 1), 4)
         error = self.estimator(carrier_rgb=carrier_rgb, reference_rgb=reference_rgb, carrier_hair_mask=stats_mask, reference_hair_mask=reference_hair_mask)
+        scalar_error_keys = (
+            "carrier_l_q10", "carrier_l_q25", "carrier_l_q50", "carrier_l_q75", "carrier_l_q90",
+            "reference_l_q10", "reference_l_q25", "reference_l_q50", "reference_l_q75", "reference_l_q90",
+            "carrier_chroma_median", "reference_chroma_median", "carrier_hue", "reference_hue",
+            "l_error_q50", "l_distribution_error", "ab_error", "chroma_error", "hue_error_deg",
+            "hue_metric_valid", "gate_metric_valid", "l_gate_strength", "ab_gate_strength",
+            "shading_gate_strength", "plausibility_gate_strength", "no_op",
+        )
+        for key in scalar_error_keys:
+            if key in error:
+                error[key] = _batch_scalar(error[key], carrier_rgb.size(0), name=key)
         # A sparse trusted core is not allowed to produce a gate.  The eroded
         # target is only a deterministic statistics fallback for diagnostics.
         gate_metric_valid = (trusted_count >= 256).float() if supplied_stats else error["gate_metric_valid"]
@@ -91,7 +123,7 @@ class HairPhotometricResidualV847:
         delta_l = _blur(delta_l_raw, self.residual_radius).clamp(-self.max_delta_l, self.max_delta_l)
         l_gate = error["l_gate_strength"].view(-1, 1, 1, 1) if enable_l else torch.zeros_like(target_soft)
         gated_delta_l = l_gate * delta_l * target_soft
-        final_l = carrier_l + gated_delta_l
+        final_l = _spatialize(carrier_l + gated_delta_l, carrier_l, name="final_l")
 
         carrier_ab_low = _blur(carrier_ab, self.low_radius)
         carrier_ab_detail = carrier_ab - carrier_ab_low
@@ -101,9 +133,13 @@ class HairPhotometricResidualV847:
         ab_gate = error["ab_gate_strength"].view(-1, 1, 1, 1) if enable_ab else torch.zeros_like(target_soft)
         final_ab_low = carrier_ab_low + ab_gate * delta_ab_center * target_soft
         hue_mix = torch.where((error["hue_error_deg"] > 5.0) & (error["reference_chroma_median"] >= 12.0), (ab_gate.flatten() * .15).clamp(max=.15), torch.zeros_like(ab_gate.flatten())).view(-1, 1, 1, 1)
-        final_ab_low = _normalize((1.0 - hue_mix) * final_ab_low + hue_mix * reference_ab_center)
-        final_ab_low = final_ab_low * torch.linalg.vector_norm(carrier_ab_low + ab_gate * delta_ab_center * target_soft, dim=1, keepdim=True).clamp_min(0.0)
-        provisional_ab = final_ab_low + carrier_ab_detail
+        final_ab_low = _spatialize((1.0 - hue_mix) * final_ab_low + hue_mix * reference_ab_center, carrier_ab, name="final_ab_low_pre_norm")
+        final_ab_low = _normalize(final_ab_low)
+        target_ab = _spatialize(carrier_ab_low + ab_gate * delta_ab_center * target_soft, carrier_ab, name="target_ab")
+        final_ab_low = _spatialize(final_ab_low * torch.linalg.vector_norm(target_ab, dim=1, keepdim=True).clamp_min(0.0), carrier_ab, name="final_ab_low")
+        final_ab_low = _spatialize(final_ab_low, carrier_ab, name="final_ab_low")
+        carrier_ab_detail = _spatialize(carrier_ab_detail, carrier_ab, name="carrier_ab_detail")
+        provisional_ab = _spatialize(final_ab_low + carrier_ab_detail, carrier_ab, name="provisional_ab")
         provisional_c = provisional_ab.norm(dim=1, keepdim=True)
 
         carrier_shadow = _region_ratio(carrier_ab.norm(dim=1, keepdim=True), carrier_l, target_hair_mask, .20)
@@ -129,7 +165,11 @@ class HairPhotometricResidualV847:
             plausibility_gate = torch.full_like(shading_gate, .5)
             plausibility = 1.0 - .20 * ((reference_l.float() - source_hair_l.float()).clamp_min(0.0) / 40.0).clamp(0, 1) * target_soft
             final_c = final_c * plausibility
-        final_ab = _normalize(provisional_ab) * final_c
+        # All Lab maps must share carrier spatial dimensions.  This also
+        # prevents a flattened one-sample statistic from broadcasting across
+        # H/W and producing a malformed [B,C,HW,1] candidate.
+        final_c = _spatialize(final_c, carrier_l, name="final_c")
+        final_ab = _spatialize(_normalize(provisional_ab) * final_c, carrier_ab, name="final_ab")
         conditioned, pre_scale = gamut_precondition_v843(torch.cat((final_l, final_ab), dim=1))
         rgb_safe, gamut_aux = gamut_safe_lab_to_rgb_v841(conditioned, return_aux=True)
         # The candidate is hair-only: restore the frozen carrier everywhere

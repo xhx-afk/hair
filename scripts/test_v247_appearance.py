@@ -166,6 +166,8 @@ def run_checks() -> None:
     probe = AppearanceProbeV247()
     source_l = torch.full_like(target, .05); reference_l = torch.full_like(target, .95)
     outputs, aux = probe(carrier_rgb=base, reference_rgb=reference, target_hair_mask=target, reference_hair_mask=target, strong_anchor_rgb=base, source_hair_l=source_l, reference_l=reference_l, trusted_alpha=trusted, return_aux=True)
+    for variant in ("c0", "c1", "c2", "c3", "c4", "c5"):
+        assert outputs[f"{variant}_rgb"].shape == base.shape
     assert set(aux["c0"].keys()) == set(aux["c1"].keys())
     assert torch.allclose(aux["c4"]["plausibility_scale"], torch.ones_like(aux["c4"]["plausibility_scale"]))
     assert float(aux["c5"]["plausibility_scale"].min()) < 1.0
